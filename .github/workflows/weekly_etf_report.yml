@@ -3,7 +3,7 @@ name: Weekly ETF Analyst Report
 on:
   workflow_dispatch:
   schedule:
-    - cron: "25 15 * * 5"
+    - cron: "40 15 * * 5"
       timezone: "America/Toronto"
 
 jobs:
