@@ -3,7 +3,8 @@ name: Weekly ETF Analyst Report
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * 6"   # Friday 10 PM Toronto during EST/EDT approximation via UTC
+    - cron: "25 15 * * 5"
+      timezone: "America/Toronto"
 
 jobs:
   run-etf-report:
