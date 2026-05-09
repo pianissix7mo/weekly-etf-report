@@ -3,7 +3,7 @@ name: Weekly ETF Analyst Report
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * 2-6"
+    - cron: "0 23 * * 1-5"
 
 jobs:
   run-etf-report:
