@@ -1679,7 +1679,8 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
        Yahoo target prices, Current price, Analyst Count, Name
     """
     if output_path is None:
-        output_path = OUTPUT_DIR / "ETF_analyst_target_report.xlsx"
+        today_code = pd.Timestamp.today().strftime("%y%m%d")
+        output_path = OUTPUT_DIR / f"ETF_analyst_report_{today_code}.xlsx"
     else:
         output_path = Path(output_path)
 
