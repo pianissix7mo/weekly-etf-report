@@ -21,6 +21,7 @@ import smtplib
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 DEFAULT_RECIPIENTS = "mofeiwang@hotmail.com,mofeiwang@yahoo.ca"
 
@@ -85,6 +86,14 @@ def send_email_with_attachment(report_path: Path) -> None:
 def main() -> None:
     report_dir = Path(os.environ.get("REPORT_DIR", "etf_analyst_target_outputs"))
     report_path = find_latest_report(report_dir)
+
+    today_code = datetime.now(ZoneInfo("America/Toronto")).strftime("%y%m%d")
+    dated_report_path = report_dir / f"ETF_analyst_target_report_{today_code}.xlsx"
+
+    if report_path.name != dated_report_path.name:
+        dated_report_path.write_bytes(report_path.read_bytes())
+        report_path = dated_report_path
+
     send_email_with_attachment(report_path)
 
 
