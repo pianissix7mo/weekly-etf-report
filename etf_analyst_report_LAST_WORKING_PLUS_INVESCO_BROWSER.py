@@ -3302,7 +3302,7 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
     - Detail sheets remove Analyst Count column.
     """
     if output_path is None:
-        output_path = OUTPUT_DIR / "ETF_analyst_target_report.xlsx"
+        output_path = OUTPUT_DIR / "ETF_analyst_report.xlsx"
     else:
         output_path = Path(output_path)
 
