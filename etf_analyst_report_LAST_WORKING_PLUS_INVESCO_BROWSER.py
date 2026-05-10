@@ -1680,7 +1680,7 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
     """
     if output_path is None:
         today_code = pd.Timestamp.now(tz="America/Toronto").strftime("%y%m%d")
-        output_path = OUTPUT_DIR / f"ETF_analyst_target_report_{today_code}.xlsx"
+        output_path = OUTPUT_DIR / f"ETF_analyst_report_{today_code}.xlsx"
     else:
         output_path = Path(output_path)
 
