@@ -88,7 +88,7 @@ def main() -> None:
     report_path = find_latest_report(report_dir)
 
     today_code = datetime.now(ZoneInfo("America/Toronto")).strftime("%y%m%d")
-    dated_report_path = report_dir / f"ETF_analyst_target_report_{today_code}.xlsx"
+    dated_report_path = report_dir / f"ETF_analyst_report_{today_code}.xlsx"
 
     if report_path.name != dated_report_path.name:
         dated_report_path.write_bytes(report_path.read_bytes())
