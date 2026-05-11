@@ -3,10 +3,7 @@ name: ETF Analyst Report
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions uses UTC.
-    # 00:00 UTC Tue-Sat is approximately 7 PM Toronto Mon-Fri during EST.
-    # During daylight saving time, it is approximately 8 PM Toronto Mon-Fri.
-    - cron: "0 0 * * 2-6"
+    - cron: "0 23 * * 1-5"
 
 permissions:
   contents: write
@@ -33,7 +30,7 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run ETF analyst report
-        run: etf_analyst_report_complete.py
+        run: python etf_analyst_report_complete.py
 
       - name: Commit PE history and latest report
         run: |
