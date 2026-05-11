@@ -4363,6 +4363,1354 @@ def pull_issuer_holdings(etf):
 
     return holdings
 
+
+# ============================================================
+# FINAL OVERRIDE: YTD, PE, EPS, EPS GROWTH, FEAR/GREED, CLEAN ETF TABS
+# Paste this ABOVE the final SCRIPT RUN block.
+# ============================================================
+
+import json
+import numpy as np
+
+
+# ------------------------------------------------------------
+# Small numeric helpers
+# ------------------------------------------------------------
+
+def safe_float_value(x):
+    try:
+        if isinstance(x, pd.Series):
+            x = x.dropna()
+            if x.empty:
+                return None
+            x = x.iloc[0]
+
+        if isinstance(x, (list, tuple)):
+            if not x:
+                return None
+            x = x[0]
+
+        if x is None:
+            return None
+
+        if pd.isna(x):
+            return None
+
+        if isinstance(x, str):
+            x = (
+                x.replace(",", "")
+                .replace("%", "")
+                .replace("$", "")
+                .replace("x", "")
+                .strip()
+            )
+            if x.lower() in ["", "-", "--", "nan", "none", "n/a", "null"]:
+                return None
+
+        return float(x)
+
+    except Exception:
+        return None
+
+
+def normalize_growth_rate(x):
+    """
+    Convert Yahoo/yfinance growth values to decimal.
+    Example:
+    0.15 stays 0.15.
+    15 becomes 0.15.
+    """
+    v = safe_float_value(x)
+
+    if v is None:
+        return None
+
+    if abs(v) > 1.5:
+        return v / 100.0
+
+    return v
+
+
+# ------------------------------------------------------------
+# YTD performance
+# ------------------------------------------------------------
+
+def get_ytd_return_from_yahoo(symbol):
+    """
+    YTD return based on adjusted close:
+        latest adjusted close / first adjusted close of this year - 1
+    """
+    try:
+        today = pd.Timestamp.now(tz="America/Toronto")
+        start = f"{today.year}-01-01"
+        end = (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+        hist = yf.Ticker(symbol).history(
+            start=start,
+            end=end,
+            auto_adjust=True,
+        )
+
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return None
+
+        closes = hist["Close"].dropna()
+
+        if len(closes) < 2:
+            return None
+
+        return float(closes.iloc[-1] / closes.iloc[0] - 1)
+
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------
+# yfinance earnings / EPS helpers
+# ------------------------------------------------------------
+
+def get_yf_dataframe(ticker_obj, names):
+    """
+    Tries both method and property styles:
+    get_earnings_estimate()
+    earnings_estimate
+    get_growth_estimates()
+    growth_estimates
+    """
+    for name in names:
+        try:
+            obj = getattr(ticker_obj, name, None)
+
+            if obj is None:
+                continue
+
+            if callable(obj):
+                df = obj()
+            else:
+                df = obj
+
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df.copy()
+
+        except Exception:
+            pass
+
+    return pd.DataFrame()
+
+
+def norm_label(x):
+    return re.sub(r"[^a-z0-9+\-]", "", str(x).lower())
+
+
+def find_estimate_row(df, row_patterns):
+    if df is None or df.empty:
+        return None
+
+    normalized_patterns = [norm_label(x) for x in row_patterns]
+
+    for idx in df.index:
+        ni = norm_label(idx)
+
+        for pat in normalized_patterns:
+            if ni == pat or pat in ni:
+                return df.loc[idx]
+
+    return None
+
+
+def row_average_value(row):
+    """
+    Pull average estimate from a yfinance estimate row.
+    Handles columns like:
+    avg, average, Avg. Estimate, avgEstimate
+    """
+    if row is None:
+        return None
+
+    if isinstance(row, pd.DataFrame):
+        if row.empty:
+            return None
+        row = row.iloc[0]
+
+    preferred = [
+        "avg",
+        "average",
+        "avgestimate",
+        "avg estimate",
+        "avg.",
+        "mean",
+    ]
+
+    for col in row.index:
+        nc = norm_label(col)
+
+        if any(norm_label(p) in nc for p in preferred):
+            v = safe_float_value(row[col])
+            if v is not None:
+                return v
+
+    # fallback: first usable numeric value
+    for col in row.index:
+        v = safe_float_value(row[col])
+        if v is not None:
+            return v
+
+    return None
+
+
+def get_annual_eps_from_financials(ticker_obj):
+    """
+    EPS Last Year = latest annual Diluted EPS from yfinance financials.
+    EPS Growth Last Year = latest annual EPS / previous annual EPS - 1.
+    """
+    candidates = []
+
+    try:
+        candidates.append(ticker_obj.income_stmt)
+    except Exception:
+        pass
+
+    try:
+        candidates.append(ticker_obj.financials)
+    except Exception:
+        pass
+
+    try:
+        candidates.append(ticker_obj.get_income_stmt(freq="yearly"))
+    except Exception:
+        pass
+
+    try:
+        candidates.append(ticker_obj.get_financials())
+    except Exception:
+        pass
+
+    row_names = [
+        "Diluted EPS",
+        "Basic EPS",
+        "Normalized Diluted EPS",
+        "DilutedEPS",
+        "BasicEPS",
+    ]
+
+    for df in candidates:
+        try:
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            row_key = None
+            norm_index = {norm_label(i): i for i in df.index}
+
+            for rn in row_names:
+                nrn = norm_label(rn)
+
+                for ni, original_idx in norm_index.items():
+                    if nrn == ni or nrn in ni:
+                        row_key = original_idx
+                        break
+
+                if row_key is not None:
+                    break
+
+            if row_key is None:
+                continue
+
+            row = pd.to_numeric(df.loc[row_key], errors="coerce").dropna()
+
+            if row.empty:
+                continue
+
+            # Try to sort columns by date descending.
+            try:
+                date_map = pd.to_datetime(row.index, errors="coerce")
+                if date_map.notna().sum() >= 2:
+                    order = np.argsort(date_map.values)[::-1]
+                    row = row.iloc[order]
+            except Exception:
+                pass
+
+            latest_eps = safe_float_value(row.iloc[0])
+            prior_eps = safe_float_value(row.iloc[1]) if len(row) >= 2 else None
+
+            growth_last_year = None
+            if latest_eps is not None and prior_eps not in [None, 0]:
+                if prior_eps > 0:
+                    growth_last_year = latest_eps / prior_eps - 1
+
+            return latest_eps, growth_last_year
+
+        except Exception:
+            pass
+
+    return None, None
+
+
+def get_eps_estimates_from_yfinance(ticker_obj):
+    """
+    Current year and next year EPS estimates.
+    Uses yfinance earnings_estimate / get_earnings_estimate when available.
+    """
+    df = get_yf_dataframe(
+        ticker_obj,
+        ["get_earnings_estimate", "earnings_estimate"],
+    )
+
+    eps_this_year = None
+    eps_next_year = None
+
+    if not df.empty:
+        current_row = find_estimate_row(
+            df,
+            ["0y", "current year", "currentyear", "current fiscal year"],
+        )
+        next_row = find_estimate_row(
+            df,
+            ["+1y", "next year", "nextyear", "next fiscal year"],
+        )
+
+        eps_this_year = row_average_value(current_row)
+        eps_next_year = row_average_value(next_row)
+
+    # Info fallback.
+    try:
+        info = ticker_obj.get_info()
+    except Exception:
+        try:
+            info = ticker_obj.info
+        except Exception:
+            info = {}
+
+    if isinstance(info, dict):
+        if eps_this_year is None:
+            for k in ["epsCurrentYear", "currentYearEps", "earningsEstimateCurrentYear"]:
+                if k in info:
+                    eps_this_year = safe_float_value(info.get(k))
+                    if eps_this_year is not None:
+                        break
+
+        if eps_next_year is None:
+            for k in ["epsNextYear", "nextYearEps", "earningsEstimateNextYear"]:
+                if k in info:
+                    eps_next_year = safe_float_value(info.get(k))
+                    if eps_next_year is not None:
+                        break
+
+    return eps_this_year, eps_next_year
+
+
+def get_growth_estimates_from_yfinance(ticker_obj):
+    """
+    Optional fallback from yfinance growth_estimates.
+    Usually rows include 0y and +1y.
+    """
+    df = get_yf_dataframe(
+        ticker_obj,
+        ["get_growth_estimates", "growth_estimates"],
+    )
+
+    growth_this_year = None
+    growth_next_year = None
+
+    if df.empty:
+        return growth_this_year, growth_next_year
+
+    current_row = find_estimate_row(
+        df,
+        ["0y", "current year", "currentyear"],
+    )
+    next_row = find_estimate_row(
+        df,
+        ["+1y", "next year", "nextyear"],
+    )
+
+    def first_growth_value(row):
+        if row is None:
+            return None
+
+        if isinstance(row, pd.DataFrame):
+            if row.empty:
+                return None
+            row = row.iloc[0]
+
+        preferred_cols = [
+            "stock trend",
+            "stocktrend",
+            "growth",
+            "estimate",
+        ]
+
+        for col in row.index:
+            nc = norm_label(col)
+            if any(norm_label(p) in nc for p in preferred_cols):
+                v = normalize_growth_rate(row[col])
+                if v is not None:
+                    return v
+
+        for col in row.index:
+            v = normalize_growth_rate(row[col])
+            if v is not None:
+                return v
+
+        return None
+
+    growth_this_year = first_growth_value(current_row)
+    growth_next_year = first_growth_value(next_row)
+
+    return growth_this_year, growth_next_year
+
+
+def get_eps_and_growth_data(ticker_obj):
+    """
+    Returns:
+    EPS Last Year
+    EPS This Year Est Avg
+    EPS Next Year Est Avg
+    EPS Growth Last Year
+    EPS Growth This Year Est
+    EPS Growth Next Year Est
+    """
+    eps_last_year, growth_last_year = get_annual_eps_from_financials(ticker_obj)
+    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
+
+    growth_this_year = None
+    growth_next_year = None
+
+    if eps_last_year not in [None, 0] and eps_this_year is not None:
+        if eps_last_year > 0:
+            growth_this_year = eps_this_year / eps_last_year - 1
+
+    if eps_this_year not in [None, 0] and eps_next_year is not None:
+        if eps_this_year > 0:
+            growth_next_year = eps_next_year / eps_this_year - 1
+
+    # If calculated growth is missing, try yfinance growth_estimates.
+    yf_growth_this, yf_growth_next = get_growth_estimates_from_yfinance(ticker_obj)
+
+    if growth_this_year is None:
+        growth_this_year = yf_growth_this
+
+    if growth_next_year is None:
+        growth_next_year = yf_growth_next
+
+    return {
+        "EPS Last Year": eps_last_year,
+        "EPS This Year Est Avg": eps_this_year,
+        "EPS Next Year Est Avg": eps_next_year,
+        "EPS Growth Last Year": growth_last_year,
+        "EPS Growth This Year Est": growth_this_year,
+        "EPS Growth Next Year Est": growth_next_year,
+    }
+
+
+# ------------------------------------------------------------
+# Override Yahoo puller
+# ------------------------------------------------------------
+
+def pull_yahoo_targets(symbol):
+    out = {
+        "Yahoo Ticker": symbol,
+        "Current Price": None,
+        "Target Low": None,
+        "Target Mean": None,
+        "Target High": None,
+        "Target Median": None,
+        "Analyst Count": None,
+        "Trailing PE": None,
+        "Forward PE": None,
+        "YTD Return": None,
+        "EPS Last Year": None,
+        "EPS This Year Est Avg": None,
+        "EPS Next Year Est Avg": None,
+        "EPS Growth Last Year": None,
+        "EPS Growth This Year Est": None,
+        "EPS Growth Next Year Est": None,
+        "Yahoo Error": None,
+    }
+
+    try:
+        t = yf.Ticker(symbol)
+
+        try:
+            targets = t.get_analyst_price_targets()
+
+            if isinstance(targets, dict):
+                out["Target Low"] = targets.get("low")
+                out["Target Mean"] = targets.get("mean")
+                out["Target High"] = targets.get("high")
+                out["Target Median"] = targets.get("median")
+                out["Analyst Count"] = targets.get("numberOfAnalysts")
+
+            elif isinstance(targets, pd.DataFrame) and not targets.empty:
+                row = targets.iloc[0]
+                out["Target Low"] = row.get("low")
+                out["Target Mean"] = row.get("mean")
+                out["Target High"] = row.get("high")
+                out["Target Median"] = row.get("median")
+                out["Analyst Count"] = row.get("numberOfAnalysts")
+
+        except Exception as e:
+            out["Yahoo Error"] = f"target error: {e}"
+
+        try:
+            fast = t.fast_info
+
+            if hasattr(fast, "get"):
+                out["Current Price"] = fast.get("last_price")
+            else:
+                out["Current Price"] = getattr(fast, "last_price", None)
+
+        except Exception:
+            pass
+
+        if out["Current Price"] is None or pd.isna(out["Current Price"]):
+            try:
+                hist = t.history(period="5d", auto_adjust=False)
+
+                if hist is not None and not hist.empty:
+                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
+
+            except Exception:
+                pass
+
+        try:
+            info = t.get_info()
+        except Exception:
+            try:
+                info = t.info
+            except Exception:
+                info = {}
+
+        if isinstance(info, dict):
+            out["Trailing PE"] = safe_float_value(
+                info.get("trailingPE", info.get("trailingPe"))
+            )
+            out["Forward PE"] = safe_float_value(
+                info.get("forwardPE", info.get("forwardPe"))
+            )
+
+        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
+
+        try:
+            eps_data = get_eps_and_growth_data(t)
+            out.update(eps_data)
+        except Exception as e:
+            if out["Yahoo Error"]:
+                out["Yahoo Error"] += f" | EPS error: {e}"
+            else:
+                out["Yahoo Error"] = f"EPS error: {e}"
+
+    except Exception as e:
+        out["Yahoo Error"] = str(e)
+
+    return out
+
+
+def add_yahoo_targets(holdings):
+    rows = []
+    symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
+
+    for i, symbol in enumerate(symbols, 1):
+        print(f"Yahoo targets + PE + YTD + EPS {i}/{len(symbols)}: {symbol}")
+        rows.append(pull_yahoo_targets(symbol))
+        time.sleep(YAHOO_SLEEP_SECONDS)
+
+    targets = pd.DataFrame(rows)
+    merged = holdings.merge(targets, on="Yahoo Ticker", how="left")
+
+    numeric_cols = [
+        "Current Price",
+        "Target Low",
+        "Target Mean",
+        "Target High",
+        "Target Median",
+        "Analyst Count",
+        "Trailing PE",
+        "Forward PE",
+        "YTD Return",
+        "EPS Last Year",
+        "EPS This Year Est Avg",
+        "EPS Next Year Est Avg",
+        "EPS Growth Last Year",
+        "EPS Growth This Year Est",
+        "EPS Growth Next Year Est",
+    ]
+
+    for c in numeric_cols:
+        if c in merged.columns:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+
+    return merged
+
+
+# ------------------------------------------------------------
+# Override summary logic
+# ------------------------------------------------------------
+
+def summarize_etf(df, etf):
+    covered = df.dropna(
+        subset=["Current Price", "Target Low", "Target Mean", "Target High"]
+    ).copy()
+
+    pe_ratio, pe_covered_weight = weighted_harmonic_pe(df)
+    forward_pe_ratio, forward_pe_covered_weight = weighted_forward_pe(df)
+
+    return {
+        "ETF": etf,
+        "Total Holdings Used": len(df),
+        "Covered Holdings": len(covered),
+        "Total Weight Used": df["Weight Decimal"].sum(),
+        "Covered Weight": covered["Weight Decimal"].sum(),
+        "ETF YTD Return": get_ytd_return_from_yahoo(etf),
+        "Raw Worst Case Return": covered["Weighted Low Return"].sum(),
+        "Raw Mean Case Return": covered["Weighted Mean Return"].sum(),
+        "Raw Best Case Return": covered["Weighted High Return"].sum(),
+        "Raw Median Case Return": covered["Weighted Median Return"].sum(),
+        "PE Ratio": pe_ratio,
+        "PE Coverage Weight": pe_covered_weight,
+        "Forward PE": forward_pe_ratio,
+        "Forward PE Coverage Weight": forward_pe_covered_weight,
+    }
+
+
+def run_one_etf(etf):
+    if etf.upper() == "TECH":
+        etf = "TECH.TO"
+
+    if etf.upper() == "CHPS":
+        etf = "CHPS.TO"
+
+    holdings = pull_issuer_holdings(etf)
+    enriched = add_yahoo_targets(holdings)
+    enriched = calculate_returns(enriched)
+
+    summary = summarize_etf(enriched, etf)
+    print_summary(summary)
+
+    output_cols = [
+        "ETF",
+        "Yahoo Ticker",
+        "Raw Ticker",
+        "Name",
+        "Weight",
+        "Weight Decimal",
+        "Current Price",
+        "Target Low",
+        "Target Mean",
+        "Target High",
+        "Target Median",
+        "Analyst Count",
+        "Trailing PE",
+        "Forward PE",
+        "YTD Return",
+        "EPS Last Year",
+        "EPS This Year Est Avg",
+        "EPS Next Year Est Avg",
+        "EPS Growth Last Year",
+        "EPS Growth This Year Est",
+        "EPS Growth Next Year Est",
+        "Low Return",
+        "Mean Return",
+        "High Return",
+        "Median Return",
+        "Weighted Low Return",
+        "Weighted Mean Return",
+        "Weighted High Return",
+        "Weighted Median Return",
+        "Shares Held",
+        "Identifier",
+        "Source Note",
+        "Yahoo Error",
+    ]
+
+    enriched = (
+        enriched[[c for c in output_cols if c in enriched.columns]]
+        .sort_values("Weight", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    return enriched, summary
+
+
+def build_excel_summary_rows(summary_df):
+    rows = []
+
+    for _, r in summary_df.iterrows():
+        etf = r["ETF"]
+        current_price = get_etf_current_price(etf)
+        worst_return = r.get("Raw Worst Case Return")
+
+        worst_price = None
+        if current_price is not None and pd.notna(worst_return):
+            worst_price = current_price * (1 + worst_return)
+
+        rows.append({
+            "ETF": etf,
+            "reliable": r.get("Covered Weight"),
+            "YTD": r.get("ETF YTD Return"),
+            "Average": r.get("Raw Mean Case Return"),
+            "Median": r.get("Raw Median Case Return"),
+            "WORST": r.get("Raw Worst Case Return"),
+            "BEST": r.get("Raw Best Case Return"),
+            "Current pr": current_price,
+            "worst price": worst_price,
+            "PE Ratio": r.get("PE Ratio"),
+            "PE coverage": r.get("PE Coverage Weight"),
+            "Forward PE": r.get("Forward PE"),
+            "Forward PE coverage": r.get("Forward PE Coverage Weight"),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------
+# Fear & Greed Index block
+# ------------------------------------------------------------
+
+def fear_greed_rating_from_score(score):
+    s = safe_float_value(score)
+
+    if s is None:
+        return None
+
+    if s <= 24:
+        return "Extreme Fear"
+    if s <= 44:
+        return "Fear"
+    if s <= 55:
+        return "Neutral"
+    if s <= 75:
+        return "Greed"
+
+    return "Extreme Greed"
+
+
+def parse_cnn_timestamp(ts):
+    try:
+        v = safe_float_value(ts)
+
+        if v is None:
+            return None
+
+        # CNN timestamps are often milliseconds.
+        if v > 10_000_000_000:
+            dt = pd.to_datetime(v, unit="ms", utc=True)
+        else:
+            dt = pd.to_datetime(v, unit="s", utc=True)
+
+        return dt.tz_convert("America/Toronto").strftime("%Y-%m-%d %H:%M")
+
+    except Exception:
+        return None
+
+
+def build_fear_greed_summary():
+    """
+    Pull CNN Fear & Greed current score.
+    If CNN endpoint changes or blocks, returns an empty df and error.
+    """
+    urls = [
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2020-01-01",
+    ]
+
+    headers = dict(HEADERS)
+    headers["Referer"] = "https://www.cnn.com/markets/fear-and-greed"
+
+    last_error = None
+
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+
+            fg = (
+                data.get("fear_and_greed")
+                or data.get("fearAndGreed")
+                or data.get("fear_and_greed_now")
+                or {}
+            )
+
+            if not isinstance(fg, dict):
+                continue
+
+            score = (
+                fg.get("score")
+                or fg.get("value")
+                or fg.get("current_score")
+                or fg.get("fearGreedScore")
+            )
+
+            score = safe_float_value(score)
+
+            if score is None:
+                continue
+
+            rating = (
+                fg.get("rating")
+                or fg.get("classification")
+                or fg.get("status")
+                or fear_greed_rating_from_score(score)
+            )
+
+            timestamp = (
+                fg.get("timestamp")
+                or fg.get("lastUpdated")
+                or fg.get("asOf")
+                or data.get("timestamp")
+            )
+
+            as_of = parse_cnn_timestamp(timestamp)
+            if as_of is None:
+                as_of = pd.Timestamp.now(tz="America/Toronto").strftime("%Y-%m-%d %H:%M")
+
+            out = pd.DataFrame([{
+                "Metric": "CNN Fear & Greed Index",
+                "Score": score,
+                "Rating": rating,
+                "As of": as_of,
+                "Source": "CNN",
+            }])
+
+            return out, None
+
+        except Exception as e:
+            last_error = repr(e)
+
+    return pd.DataFrame(), last_error or "No usable CNN Fear & Greed data returned."
+
+
+# ------------------------------------------------------------
+# Detail sheet without Name and Source Note
+# ------------------------------------------------------------
+
+def prepare_detail_sheet(details):
+    df = details.copy()
+
+    out = pd.DataFrame()
+    out["Ticker"] = df["Yahoo Ticker"]
+    out["% of Portfolio"] = df["Weight Decimal"]
+    out["YTD"] = df["YTD Return"]
+    out["Worst"] = df["Low Return"]
+    out["Average"] = df["Mean Return"]
+    out["Median"] = df["Median Return"]
+    out["Best"] = df["High Return"]
+
+    out["Worst Target"] = df["Target Low"]
+    out["Average Target"] = df["Target Mean"]
+    out["Median Target"] = df["Target Median"]
+    out["Best Target"] = df["Target High"]
+    out["Current"] = df["Current Price"]
+
+    out["Current PE"] = df["Trailing PE"]
+    out["Forward PE"] = df["Forward PE"]
+
+    out["EPS Last Year"] = df["EPS Last Year"]
+    out["EPS This Year Est Avg"] = df["EPS This Year Est Avg"]
+    out["EPS Next Year Est Avg"] = df["EPS Next Year Est Avg"]
+
+    out["EPS Growth Last Year"] = df["EPS Growth Last Year"]
+    out["EPS Growth This Year Est"] = df["EPS Growth This Year Est"]
+    out["EPS Growth Next Year Est"] = df["EPS Growth Next Year Est"]
+
+    out = out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
+    return out
+
+
+# ------------------------------------------------------------
+# Excel exporter override
+# ------------------------------------------------------------
+
+def export_excel_report(all_details, summaries, output_path=None, report_date=None):
+    """
+    Updates:
+    - Main Summary includes ETF YTD.
+    - Main Summary has Fear & Greed block above VIX block.
+    - Individual ETF tabs remove Name and Source Note.
+    - Individual ETF tabs add stock YTD, current PE, forward PE, EPS and EPS growth.
+    """
+    if output_path is None:
+        output_path = OUTPUT_DIR / "ETF_analyst_report.xlsx"
+    else:
+        output_path = Path(output_path)
+
+    if report_date is None:
+        today = pd.Timestamp.now(tz="America/Toronto")
+        report_date = f"{today.month}/{today.day}/{today.year}"
+
+    summary_df = pd.DataFrame(summaries)
+    summary_rows = build_excel_summary_rows(summary_df)
+
+    fear_greed_summary, fear_greed_error = build_fear_greed_summary()
+    vix_summary, vix_error = build_vix_summary()
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+
+        title_fmt = workbook.add_format({
+            "bold": True,
+            "font_size": 12,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        })
+
+        section_fmt = workbook.add_format({
+            "bold": True,
+            "font_size": 12,
+            "align": "left",
+            "valign": "vcenter",
+        })
+
+        header_fmt = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "bg_color": "#E2F0D9",
+        })
+
+        header_white_fmt = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "bg_color": "#FFFFFF",
+        })
+
+        normal_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+        })
+
+        text_fmt = workbook.add_format({
+            "border": 1,
+            "align": "left",
+            "valign": "vcenter",
+        })
+
+        pct_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "0.00%",
+        })
+
+        pct_red_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "0.00%",
+            "font_color": "#FF0000",
+        })
+
+        pct_green_fill_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "0.00%",
+            "bg_color": "#C6E0B4",
+        })
+
+        money_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "#,##0.00",
+        })
+
+        money_red_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "#,##0.00",
+            "font_color": "#FF0000",
+        })
+
+        number_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "0.00",
+        })
+
+        int_fmt = workbook.add_format({
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "#,##0",
+        })
+
+        total_pct_fmt = workbook.add_format({
+            "bold": True,
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "num_format": "0.00%",
+        })
+
+        # ====================================================
+        # Summary sheet
+        # ====================================================
+        sheet_name = "Summary"
+        worksheet = workbook.add_worksheet(sheet_name)
+        writer.sheets[sheet_name] = worksheet
+
+        headers = [
+            "",
+            "reliable",
+            "YTD",
+            "Average",
+            "Median",
+            "WORST",
+            "BEST",
+            "Current pr",
+            "worst price",
+            "PE Ratio",
+            "PE coverage",
+            "Forward PE",
+            "Forward PE coverage",
+        ]
+
+        start_row = 3
+        start_col = 1
+
+        worksheet.write(start_row, start_col, report_date, header_fmt)
+
+        for j, h in enumerate(headers[1:], start_col + 1):
+            worksheet.write(start_row, j, h, header_white_fmt)
+
+        for i, row in summary_rows.iterrows():
+            r = start_row + 1 + i
+
+            worksheet.write(r, start_col, row["ETF"], text_fmt)
+            worksheet.write_number(r, start_col + 1, row["reliable"] if pd.notna(row["reliable"]) else 0, pct_fmt)
+            worksheet.write_number(r, start_col + 2, row["YTD"] if pd.notna(row["YTD"]) else 0, pct_fmt)
+            worksheet.write_number(r, start_col + 3, row["Average"] if pd.notna(row["Average"]) else 0, pct_fmt)
+            worksheet.write_number(r, start_col + 4, row["Median"] if pd.notna(row["Median"]) else 0, pct_fmt)
+            worksheet.write_number(r, start_col + 5, row["WORST"] if pd.notna(row["WORST"]) else 0, pct_fmt)
+            worksheet.write_number(r, start_col + 6, row["BEST"] if pd.notna(row["BEST"]) else 0, pct_fmt)
+
+            if pd.notna(row["Current pr"]):
+                worksheet.write_number(r, start_col + 7, row["Current pr"], money_fmt)
+            else:
+                worksheet.write(r, start_col + 7, "-", normal_fmt)
+
+            if pd.notna(row["worst price"]):
+                worksheet.write_number(r, start_col + 8, row["worst price"], money_red_fmt)
+            else:
+                worksheet.write(r, start_col + 8, "-", normal_fmt)
+
+            if pd.notna(row["PE Ratio"]):
+                worksheet.write_number(r, start_col + 9, row["PE Ratio"], number_fmt)
+            else:
+                worksheet.write(r, start_col + 9, "-", normal_fmt)
+
+            if pd.notna(row["PE coverage"]):
+                worksheet.write_number(r, start_col + 10, row["PE coverage"], pct_fmt)
+            else:
+                worksheet.write(r, start_col + 10, "-", normal_fmt)
+
+            if pd.notna(row["Forward PE"]):
+                worksheet.write_number(r, start_col + 11, row["Forward PE"], number_fmt)
+            else:
+                worksheet.write(r, start_col + 11, "-", normal_fmt)
+
+            if pd.notna(row["Forward PE coverage"]):
+                worksheet.write_number(r, start_col + 12, row["Forward PE coverage"], pct_fmt)
+            else:
+                worksheet.write(r, start_col + 12, "-", normal_fmt)
+
+        end_row = start_row + len(summary_rows)
+
+        worksheet.conditional_format(f"D5:H{end_row + 1}", {
+            "type": "cell",
+            "criteria": "<",
+            "value": 0,
+            "format": pct_red_fmt,
+        })
+
+        worksheet.conditional_format(f"D5:H{end_row + 1}", {
+            "type": "cell",
+            "criteria": ">=",
+            "value": 0.3,
+            "format": pct_green_fill_fmt,
+        })
+
+        # ====================================================
+        # Fear & Greed block, above VIX
+        # ====================================================
+        fg_start = end_row + 4
+        worksheet.write(fg_start, start_col, "Fear & Greed Index", section_fmt)
+
+        if fear_greed_error:
+            worksheet.write(
+                fg_start + 1,
+                start_col,
+                f"Fear & Greed data unavailable: {fear_greed_error}",
+                text_fmt,
+            )
+            vix_start = fg_start + 4
+        else:
+            fg_headers = list(fear_greed_summary.columns)
+
+            for j, h in enumerate(fg_headers, start_col):
+                worksheet.write(fg_start + 1, j, h, header_white_fmt)
+
+            for i, row in fear_greed_summary.iterrows():
+                rr = fg_start + 2 + i
+
+                for j, h in enumerate(fg_headers, start_col):
+                    val = row[h]
+
+                    if h == "Score":
+                        worksheet.write_number(rr, j, float(val), number_fmt)
+                    else:
+                        worksheet.write(rr, j, str(val), text_fmt if h in ["Metric", "Rating", "Source"] else normal_fmt)
+
+            vix_start = fg_start + 5
+
+        # ====================================================
+        # VIX block
+        # ====================================================
+        worksheet.write(vix_start, start_col, "VIX percentile analysis", section_fmt)
+
+        if vix_error:
+            worksheet.write(vix_start + 1, start_col, f"VIX data unavailable: {vix_error}", text_fmt)
+        else:
+            vix_headers = list(vix_summary.columns)
+
+            for j, h in enumerate(vix_headers, start_col):
+                worksheet.write(vix_start + 1, j, h, header_white_fmt)
+
+            for i, row in vix_summary.iterrows():
+                rr = vix_start + 2 + i
+
+                for j, h in enumerate(vix_headers, start_col):
+                    val = row[h]
+
+                    if h == "Period":
+                        worksheet.write(rr, j, val, text_fmt)
+                    elif h in ["Start Date", "End Date"]:
+                        worksheet.write(rr, j, str(val), normal_fmt)
+                    elif h == "Trading Days":
+                        worksheet.write_number(rr, j, int(val), int_fmt)
+                    elif h == "Percentile Rank":
+                        worksheet.write_number(rr, j, val / 100.0, pct_fmt)
+                    else:
+                        worksheet.write_number(rr, j, float(val), number_fmt)
+
+        worksheet.set_column("B:B", 14)
+        worksheet.set_column("C:H", 12)
+        worksheet.set_column("I:N", 14)
+        worksheet.set_column("O:P", 15)
+        worksheet.freeze_panes(start_row + 1, 0)
+
+        # ====================================================
+        # ETF detail sheets
+        # ====================================================
+        for details in all_details:
+            if details.empty:
+                continue
+
+            etf_values = details["ETF"].dropna().astype(str).unique()
+            etf = etf_values[0] if len(etf_values) > 0 else f"ETF_{len(writer.sheets)}"
+
+            safe_sheet_base = (
+                etf.replace(".", "_")
+                .replace("/", "_")
+                .replace("\\", "_")
+                .replace("?", "_")
+                .replace("*", "_")
+                .replace("[", "_")
+                .replace("]", "_")
+                .replace(":", "_")
+            )
+
+            safe_sheet_base = safe_sheet_base[:31] if safe_sheet_base else f"ETF_{len(writer.sheets)}"
+
+            safe_sheet = safe_sheet_base
+            counter = 1
+            used_sheets_lower = {name.lower() for name in writer.sheets.keys()}
+
+            while safe_sheet.lower() in used_sheets_lower:
+                suffix = f"_{counter}"
+                safe_sheet = safe_sheet_base[:31 - len(suffix)] + suffix
+                counter += 1
+
+            detail = prepare_detail_sheet(details)
+
+            ws = workbook.add_worksheet(safe_sheet)
+            writer.sheets[safe_sheet] = ws
+
+            ws.write(0, 0, report_date, header_white_fmt)
+            ws.write(0, 1, "Weight", header_white_fmt)
+            ws.write(0, 2, "YTD", header_white_fmt)
+            ws.merge_range(0, 3, 0, 6, "Analyst Target Return", title_fmt)
+            ws.merge_range(0, 8, 0, 20, "Yahoo Finance", title_fmt)
+
+            main_headers = [
+                etf,
+                "% of Portfolio",
+                "YTD",
+                "Worst",
+                "Average",
+                "Median",
+                "Best",
+                "",
+                "Worst Target",
+                "Average Target",
+                "Median Target",
+                "Best Target",
+                "Current",
+                "Current PE",
+                "Forward PE",
+                "EPS Last Year",
+                "EPS This Year Est Avg",
+                "EPS Next Year Est Avg",
+                "EPS Growth Last Year",
+                "EPS Growth This Year Est",
+                "EPS Growth Next Year Est",
+            ]
+
+            for c, h in enumerate(main_headers):
+                ws.write(1, c, h, header_white_fmt)
+
+            data_start = 2
+
+            for i, row in detail.iterrows():
+                r = data_start + i
+
+                ws.write(r, 0, row["Ticker"], text_fmt)
+
+                ws.write_number(
+                    r,
+                    1,
+                    row["% of Portfolio"] if pd.notna(row["% of Portfolio"]) else 0,
+                    pct_fmt,
+                )
+
+                # YTD
+                if pd.notna(row["YTD"]):
+                    ws.write_number(r, 2, row["YTD"], pct_fmt)
+                else:
+                    ws.write(r, 2, "-", normal_fmt)
+
+                # Return columns
+                for col_idx, col_name in enumerate(["Worst", "Average", "Median", "Best"], start=3):
+                    val = row[col_name]
+
+                    if pd.notna(val):
+                        ws.write_number(r, col_idx, val, pct_fmt)
+                    else:
+                        ws.write(r, col_idx, "-", normal_fmt)
+
+                ws.write(r, 7, "", normal_fmt)
+
+                # Target/current prices
+                for col_idx, col_name in enumerate(
+                    ["Worst Target", "Average Target", "Median Target", "Best Target", "Current"],
+                    start=8,
+                ):
+                    val = row[col_name]
+
+                    if pd.notna(val):
+                        fmt = money_red_fmt if col_name == "Current" else money_fmt
+                        ws.write_number(r, col_idx, val, fmt)
+                    else:
+                        ws.write(r, col_idx, "-", normal_fmt)
+
+                # PE columns
+                for col_idx, col_name in enumerate(["Current PE", "Forward PE"], start=13):
+                    val = row[col_name]
+
+                    if pd.notna(val):
+                        ws.write_number(r, col_idx, val, number_fmt)
+                    else:
+                        ws.write(r, col_idx, "-", normal_fmt)
+
+                # EPS columns
+                for col_idx, col_name in enumerate(
+                    ["EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg"],
+                    start=15,
+                ):
+                    val = row[col_name]
+
+                    if pd.notna(val):
+                        ws.write_number(r, col_idx, val, number_fmt)
+                    else:
+                        ws.write(r, col_idx, "-", normal_fmt)
+
+                # EPS growth columns
+                for col_idx, col_name in enumerate(
+                    ["EPS Growth Last Year", "EPS Growth This Year Est", "EPS Growth Next Year Est"],
+                    start=18,
+                ):
+                    val = row[col_name]
+
+                    if pd.notna(val):
+                        ws.write_number(r, col_idx, val, pct_fmt)
+                    else:
+                        ws.write(r, col_idx, "-", normal_fmt)
+
+            total_row = data_start + len(detail) + 1
+
+            first_excel_row = data_start + 1
+            last_excel_row = data_start + len(detail)
+
+            ws.write(total_row, 0, "TOTAL", header_white_fmt)
+            ws.write_formula(total_row, 1, f"=SUM(B{first_excel_row}:B{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 2, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},C{first_excel_row}:C{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 3, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},D{first_excel_row}:D{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 4, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},E{first_excel_row}:E{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 5, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},F{first_excel_row}:F{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 6, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},G{first_excel_row}:G{last_excel_row})", total_pct_fmt)
+
+            # Color YTD + target-return columns.
+            ws.conditional_format(f"C3:G{last_excel_row}", {
+                "type": "cell",
+                "criteria": "<",
+                "value": 0,
+                "format": pct_red_fmt,
+            })
+
+            ws.conditional_format(f"C3:G{last_excel_row}", {
+                "type": "cell",
+                "criteria": ">=",
+                "value": 0.3,
+                "format": pct_green_fill_fmt,
+            })
+
+            # Color EPS growth columns.
+            ws.conditional_format(f"S3:U{last_excel_row}", {
+                "type": "cell",
+                "criteria": "<",
+                "value": 0,
+                "format": pct_red_fmt,
+            })
+
+            ws.conditional_format(f"S3:U{last_excel_row}", {
+                "type": "cell",
+                "criteria": ">=",
+                "value": 0.3,
+                "format": pct_green_fill_fmt,
+            })
+
+            ws.freeze_panes(2, 1)
+
+            ws.set_column("A:A", 11)
+            ws.set_column("B:B", 14)
+            ws.set_column("C:G", 11)
+            ws.set_column("H:H", 3)
+            ws.set_column("I:M", 13)
+            ws.set_column("N:O", 12)
+            ws.set_column("P:R", 18)
+            ws.set_column("S:U", 18)
+
+        print(f"Saved Excel report: {output_path}")
+        return output_path
+
 # ============================================================
 # SCRIPT RUN
 # ============================================================
