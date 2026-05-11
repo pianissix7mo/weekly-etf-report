@@ -2569,7 +2569,13 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         int_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0"})
         total_pct_fmt = workbook.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
         total_text_fmt = workbook.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter"})
-        group_header_fmt = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#FFFFFF"})
+        group_header_fmt = workbook.add_format({
+                "bold": True,
+                "align": "center",
+                "valign": "vcenter",
+                "border": 2,
+                "bg_color": "#FFFFFF",
+            })
         blank_no_border_fmt = workbook.add_format({"align": "center", "valign": "vcenter"})
 
         # ====================================================
