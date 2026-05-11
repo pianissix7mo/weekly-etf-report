@@ -31,7 +31,7 @@ jobs:
 
       - name: Run ETF report
         run: |
-          python etf_analyst_report_LAST_WORKING_PLUS_INVESCO_BROWSER.py
+          python etf_analyst_report_complete.py
 
       - name: Send email
         env:
