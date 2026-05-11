@@ -3,6 +3,7 @@ name: ETF Analyst Report
 on:
   workflow_dispatch:
   schedule:
+    # 7 PM Toronto during daylight saving time = 23:00 UTC
     - cron: "0 23 * * 1-5"
 
 permissions:
@@ -32,6 +33,16 @@ jobs:
       - name: Run ETF analyst report
         run: python etf_analyst_report_complete.py
 
+      - name: Send ETF report email
+        env:
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: 465
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.SMTP_USER }}
+          EMAIL_TO: mofeiwang@hotmail.com,mofeiwang@yahoo.ca
+        run: python send_etf_report_email.py
+
       - name: Commit PE history and latest report
         run: |
           git config user.name "github-actions"
@@ -39,6 +50,7 @@ jobs:
 
           git add etf_analyst_target_outputs/ETF_PE_history.xlsx
           git add etf_analyst_target_outputs/ETF_analyst_report.xlsx
+          git add etf_analyst_target_outputs/ETF_analyst_report_*.xlsx
 
           git commit -m "Update ETF PE history and report" || echo "No report changes to commit"
           git pull --rebase origin "${GITHUB_REF_NAME}" || true
@@ -51,4 +63,5 @@ jobs:
           path: |
             etf_analyst_target_outputs/ETF_analyst_report.xlsx
             etf_analyst_target_outputs/ETF_PE_history.xlsx
+            etf_analyst_target_outputs/ETF_analyst_report_*.xlsx
           retention-days: 30
