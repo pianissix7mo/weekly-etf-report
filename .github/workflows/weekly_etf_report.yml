@@ -49,8 +49,6 @@ jobs:
           git config user.email "github-actions@github.com"
 
           git add etf_analyst_target_outputs/ETF_PE_history.xlsx
-          git add etf_analyst_target_outputs/ETF_analyst_report.xlsx
-          git add etf_analyst_target_outputs/ETF_analyst_report_*.xlsx
 
           git commit -m "Update ETF PE history and report" || echo "No report changes to commit"
           git pull --rebase origin "${GITHUB_REF_NAME}" || true
