@@ -1,44 +1,57 @@
-name: Weekly ETF Analyst Report
+name: ETF Analyst Report
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 23 * * 1-5"
+    # GitHub Actions uses UTC.
+    # 00:00 UTC Tue-Sat is approximately 7 PM Toronto Mon-Fri during EST.
+    # During daylight saving time, it is approximately 8 PM Toronto Mon-Fri.
+    - cron: "0 0 * * 2-6"
+
+permissions:
+  contents: write
 
 jobs:
-  run-etf-report:
+  run-report:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repo
+      - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libnss3 libatk-bridge2.0-0 libgtk-3-0 libxss1 libasound2t64
-
-      - name: Install Python packages
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install chromium
+          pip install pandas numpy requests yfinance beautifulsoup4 XlsxWriter openpyxl lxml html5lib pypdf playwright
+          python -m playwright install --with-deps chromium
 
-      - name: Run ETF report
-        run: |
-          python etf_analyst_report_complete.py
+      - name: Run ETF analyst report
+        run: python etf_analyst_report_pe_history_graphs_v4.py
 
-      - name: Send email
-        env:
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: "465"
-          SMTP_USER: pianissix7mo@gmail.com
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: pianissix7mo@gmail.com
+      - name: Commit PE history and latest report
         run: |
-          python send_etf_report_email.py
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add etf_analyst_target_outputs/ETF_PE_history.xlsx
+          git add etf_analyst_target_outputs/ETF_analyst_report.xlsx
+
+          git commit -m "Update ETF PE history and report" || echo "No report changes to commit"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ETF-analyst-report
+          path: |
+            etf_analyst_target_outputs/ETF_analyst_report.xlsx
+            etf_analyst_target_outputs/ETF_PE_history.xlsx
+          retention-days: 30
