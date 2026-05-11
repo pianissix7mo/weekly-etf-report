@@ -2275,6 +2275,537 @@ def main_with_excel():
     return _ORIGINAL_MAIN_WITH_EXCEL_V3()
 
 
+
+
+# ============================================================
+# FINAL OVERRIDE V4: PE HISTORY + SUMMARY PE CHARTS + USER'S ETF TAB FORMAT
+# ============================================================
+
+REPORT_VERSION = "pe-history-graphs-layout-v4"
+PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
+
+
+def get_report_years():
+    """Return labels for last year, current year, next year based on Toronto date."""
+    today = pd.Timestamp.now(tz="America/Toronto")
+    current_year = int(today.year)
+    return current_year - 1, current_year, current_year + 1
+
+
+def update_pe_history(summaries, history_path=None):
+    """
+    Save ETF-level PE and Forward PE every time the script runs.
+    This file is designed to be committed back to GitHub by GitHub Actions.
+    """
+    if history_path is None:
+        history_path = PE_HISTORY_PATH
+    else:
+        history_path = Path(history_path)
+
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    today = pd.Timestamp.now(tz="America/Toronto").date()
+
+    new_rows = []
+    for s in summaries:
+        new_rows.append({
+            "Date": today,
+            "ETF": s.get("ETF"),
+            "PE Ratio": s.get("PE Ratio"),
+            "Forward PE": s.get("Forward PE"),
+            "PE coverage": s.get("PE Coverage Weight"),
+            "Forward PE coverage": s.get("Forward PE Coverage Weight"),
+            "YTD": s.get("ETF YTD Return"),
+            "Covered Weight": s.get("Covered Weight"),
+        })
+
+    new_df = pd.DataFrame(new_rows)
+
+    if history_path.exists():
+        try:
+            old_df = pd.read_excel(history_path)
+            old_df["Date"] = pd.to_datetime(old_df["Date"], errors="coerce").dt.date
+            combined = pd.concat([old_df, new_df], ignore_index=True)
+        except Exception as e:
+            print(f"Could not read existing PE history, rebuilding it. Error: {e}")
+            combined = new_df
+    else:
+        combined = new_df
+
+    combined = combined.dropna(subset=["Date", "ETF"], how="any")
+    combined = combined.drop_duplicates(subset=["Date", "ETF"], keep="last")
+    combined = combined.sort_values(["ETF", "Date"]).reset_index(drop=True)
+    combined.to_excel(history_path, index=False)
+    print(f"Saved PE history: {history_path}")
+    return combined
+
+
+def load_pe_history(history_path=None):
+    if history_path is None:
+        history_path = PE_HISTORY_PATH
+    else:
+        history_path = Path(history_path)
+
+    if not history_path.exists():
+        return pd.DataFrame(columns=["Date", "ETF", "PE Ratio", "Forward PE"])
+
+    try:
+        hist = pd.read_excel(history_path)
+        hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
+        hist = hist.dropna(subset=["Date", "ETF"])
+        hist = hist.sort_values(["ETF", "Date"])
+        return hist
+    except Exception as e:
+        print(f"Could not load PE history: {e}")
+        return pd.DataFrame(columns=["Date", "ETF", "PE Ratio", "Forward PE"])
+
+
+def build_excel_summary_rows(summary_df):
+    rows = []
+    for _, r in summary_df.iterrows():
+        etf = r["ETF"]
+        current_price = get_etf_current_price(etf)
+        worst_return = r.get("Raw Worst Case Return")
+
+        worst_price = None
+        if current_price is not None and pd.notna(worst_return):
+            worst_price = current_price * (1 + worst_return)
+
+        rows.append({
+            "ETF": etf,
+            "reliable": r.get("Covered Weight"),
+            "YTD": r.get("ETF YTD Return"),
+            "Average": r.get("Raw Mean Case Return"),
+            "Median": r.get("Raw Median Case Return"),
+            "WORST": r.get("Raw Worst Case Return"),
+            "BEST": r.get("Raw Best Case Return"),
+            "Current pr": current_price,
+            "worst price": worst_price,
+            "PE Ratio": r.get("PE Ratio"),
+            "PE coverage": r.get("PE Coverage Weight"),
+            "Forward PE": r.get("Forward PE"),
+            "Forward PE coverage": r.get("Forward PE Coverage Weight"),
+        })
+    return pd.DataFrame(rows)
+
+
+def prepare_detail_sheet(details):
+    df = details.copy()
+
+    # Final display guard: calculate Growth Last Year from adjusted price history if still missing.
+    if "Growth Last Year" not in df.columns:
+        df["Growth Last Year"] = np.nan
+    if "Yahoo Ticker" in df.columns:
+        missing = df["Growth Last Year"].isna()
+        if missing.any():
+            for sym in df.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
+                val = get_last_calendar_year_stock_return_from_yahoo(sym)
+                if val is not None:
+                    df.loc[df["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
+
+    out = pd.DataFrame()
+    out["Ticker"] = df["Yahoo Ticker"]
+    out["% of Portfolio"] = df["Weight Decimal"]
+    out["YTD"] = df["YTD Return"]
+    out["Worst"] = df["Low Return"]
+    out["Average"] = df["Mean Return"]
+    out["Median"] = df["Median Return"]
+    out["Best"] = df["High Return"]
+    out["Current"] = df["Current Price"]
+    out["Current PE"] = df["Trailing PE"]
+    out["Forward PE"] = df["Forward PE"]
+    out["Growth Last Year"] = df["Growth Last Year"]
+    out["Growth This Year Est"] = df["Growth This Year Est"]
+    out["Growth Next Year Est"] = df["Growth Next Year Est"]
+    out["Target Ticker"] = df["Yahoo Ticker"]
+    out["Worst Target"] = df["Target Low"]
+    out["Average Target"] = df["Target Mean"]
+    out["Median Target"] = df["Target Median"]
+    out["Best Target"] = df["Target High"]
+    out["EPS Last Year"] = df["EPS Last Year"]
+    out["EPS This Year Est Avg"] = df["EPS This Year Est Avg"]
+    out["EPS Next Year Est Avg"] = df["EPS Next Year Est Avg"]
+
+    out = out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
+    return out
+
+
+def _write_number_or_dash(ws, row, col, val, num_fmt, dash_fmt):
+    if val is not None and pd.notna(val):
+        ws.write_number(row, col, float(val), num_fmt)
+    else:
+        ws.write(row, col, "-", dash_fmt)
+
+
+def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_history, chart_start_row, start_col=1):
+    """Put PE history line charts on the Summary sheet, below all other tables."""
+    if pe_history is None or pe_history.empty:
+        worksheet.write(chart_start_row, start_col, "PE history charts will appear after more runs are saved.")
+        return
+
+    hist = pe_history.copy()
+    hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
+    hist = hist.dropna(subset=["Date", "ETF"])
+
+    if hist.empty:
+        worksheet.write(chart_start_row, start_col, "PE history charts will appear after more runs are saved.")
+        return
+
+    cutoff = pd.Timestamp.now(tz="America/Toronto").tz_localize(None) - pd.DateOffset(years=1)
+    hist_1y = hist[hist["Date"] >= cutoff].copy()
+    if hist_1y.empty:
+        hist_1y = hist.copy()
+
+    hist_1y = hist_1y.sort_values(["ETF", "Date"])
+
+    data_sheet_name = "PE_History_Data"
+    data_ws = workbook.add_worksheet(data_sheet_name)
+    writer.sheets[data_sheet_name] = data_ws
+    data_ws.hide()
+
+    headers = ["Date", "ETF", "PE Ratio", "Forward PE", "PE coverage", "Forward PE coverage", "YTD", "Covered Weight"]
+    for c, h in enumerate(headers):
+        data_ws.write(0, c, h)
+
+    date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd"})
+    num_fmt = workbook.add_format({"num_format": "0.00"})
+    pct_fmt = workbook.add_format({"num_format": "0.00%"})
+
+    for r, (_, row) in enumerate(hist_1y.iterrows(), start=1):
+        data_ws.write_datetime(r, 0, pd.Timestamp(row["Date"]).to_pydatetime(), date_fmt)
+        data_ws.write(r, 1, row.get("ETF", ""))
+        _write_number_or_dash(data_ws, r, 2, row.get("PE Ratio"), num_fmt, num_fmt)
+        _write_number_or_dash(data_ws, r, 3, row.get("Forward PE"), num_fmt, num_fmt)
+        _write_number_or_dash(data_ws, r, 4, row.get("PE coverage"), pct_fmt, pct_fmt)
+        _write_number_or_dash(data_ws, r, 5, row.get("Forward PE coverage"), pct_fmt, pct_fmt)
+        _write_number_or_dash(data_ws, r, 6, row.get("YTD"), pct_fmt, pct_fmt)
+        _write_number_or_dash(data_ws, r, 7, row.get("Covered Weight"), pct_fmt, pct_fmt)
+
+    worksheet.write(chart_start_row, start_col, "PE history, last 1 year", workbook.add_format({"bold": True, "font_size": 12}))
+
+    etfs = [e for e in hist_1y["ETF"].dropna().astype(str).unique()]
+    chart_positions = []
+    for i, etf in enumerate(etfs):
+        # 2 charts per row, each chart roughly 8 rows tall.
+        chart_row = chart_start_row + 2 + (i // 2) * 16
+        chart_col = start_col + (i % 2) * 8
+        chart_positions.append((etf, chart_row, chart_col))
+
+    for etf, chart_row, chart_col in chart_positions:
+        etf_rows = hist_1y.index[hist_1y["ETF"].astype(str) == etf].tolist()
+        if not etf_rows:
+            continue
+        # Convert dataframe position to worksheet row: header row is 0, data starts at 1.
+        first_data_pos = hist_1y.index.get_loc(etf_rows[0]) + 1 if hasattr(hist_1y.index, 'get_loc') else 1
+        # Safer: create map based on sequential writing order.
+        seq_positions = [i + 1 for i, (_, row) in enumerate(hist_1y.iterrows()) if str(row.get("ETF")) == etf]
+        first_row = min(seq_positions)
+        last_row = max(seq_positions)
+
+        chart = workbook.add_chart({"type": "line"})
+        chart.add_series({
+            "name": f"{etf} Current PE",
+            "categories": [data_sheet_name, first_row, 0, last_row, 0],
+            "values": [data_sheet_name, first_row, 2, last_row, 2],
+            "marker": {"type": "circle", "size": 4},
+        })
+        chart.add_series({
+            "name": f"{etf} Forward PE",
+            "categories": [data_sheet_name, first_row, 0, last_row, 0],
+            "values": [data_sheet_name, first_row, 3, last_row, 3],
+            "marker": {"type": "diamond", "size": 4},
+        })
+        chart.set_title({"name": f"{etf} PE vs Forward PE"})
+        chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
+        chart.set_y_axis({"name": "PE", "major_gridlines": {"visible": True}})
+        chart.set_legend({"position": "bottom"})
+        chart.set_size({"width": 520, "height": 300})
+        worksheet.insert_chart(chart_row, chart_col, chart)
+
+
+def export_excel_report(all_details, summaries, output_path=None, report_date=None, pe_history=None):
+    """
+    Create formatted Excel report.
+    Summary:
+      ETF summary + Fear & Greed + VIX + PE history charts.
+    ETF tabs:
+      Match requested visual layout with grouped headers.
+    """
+    if output_path is None:
+        output_path = OUTPUT_DIR / "ETF_analyst_report.xlsx"
+    else:
+        output_path = Path(output_path)
+
+    if report_date is None:
+        today = pd.Timestamp.now(tz="America/Toronto")
+        report_date = f"{today.month}/{today.day}/{today.year}"
+
+    last_year, current_year, next_year = get_report_years()
+
+    summary_df = pd.DataFrame(summaries)
+    summary_rows = build_excel_summary_rows(summary_df)
+    fear_greed_summary, fear_greed_error = build_fear_greed_summary()
+    vix_summary, vix_error = build_vix_summary()
+
+    if pe_history is None:
+        pe_history = load_pe_history()
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+
+        title_fmt = workbook.add_format({
+            "bold": True, "font_size": 12, "align": "center", "valign": "vcenter", "border": 1,
+        })
+        section_fmt = workbook.add_format({"bold": True, "font_size": 12, "align": "left", "valign": "vcenter"})
+        header_fmt = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#E2F0D9"})
+        header_white_fmt = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#FFFFFF"})
+        normal_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter"})
+        text_fmt = workbook.add_format({"border": 1, "align": "left", "valign": "vcenter"})
+        pct_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
+        pct_red_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%", "font_color": "#FF0000"})
+        pct_green_fill_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%", "bg_color": "#C6E0B4"})
+        money_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0.00"})
+        money_red_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0.00", "font_color": "#FF0000"})
+        number_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00"})
+        int_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0"})
+        total_pct_fmt = workbook.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
+        total_text_fmt = workbook.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter"})
+        group_header_fmt = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#FFFFFF"})
+        blank_no_border_fmt = workbook.add_format({"align": "center", "valign": "vcenter"})
+
+        # ====================================================
+        # Summary sheet
+        # ====================================================
+        sheet_name = "Summary"
+        worksheet = workbook.add_worksheet(sheet_name)
+        writer.sheets[sheet_name] = worksheet
+
+        headers = [
+            "", "reliable", "YTD", "Average", "Median", "WORST", "BEST",
+            "Current pr", "worst price", "PE Ratio", "PE coverage", "Forward PE", "Forward PE coverage",
+        ]
+        start_row = 3
+        start_col = 1
+        worksheet.write(start_row, start_col, report_date, header_fmt)
+        for j, h in enumerate(headers[1:], start_col + 1):
+            worksheet.write(start_row, j, h, header_white_fmt)
+
+        for i, row in summary_rows.iterrows():
+            r = start_row + 1 + i
+            worksheet.write(r, start_col, row["ETF"], text_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 1, row["reliable"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 2, row["YTD"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 3, row["Average"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 4, row["Median"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 5, row["WORST"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 6, row["BEST"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 7, row["Current pr"], money_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 8, row["worst price"], money_red_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 9, row["PE Ratio"], number_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 10, row["PE coverage"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 11, row["Forward PE"], number_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, start_col + 12, row["Forward PE coverage"], pct_fmt, normal_fmt)
+
+        end_row = start_row + len(summary_rows)
+        worksheet.conditional_format(f"D5:H{end_row + 1}", {"type": "cell", "criteria": "<", "value": 0, "format": pct_red_fmt})
+        worksheet.conditional_format(f"D5:H{end_row + 1}", {"type": "cell", "criteria": ">=", "value": 0.3, "format": pct_green_fill_fmt})
+
+        # Fear & Greed block
+        fg_start = end_row + 4
+        worksheet.write(fg_start, start_col, "Fear & Greed Index", section_fmt)
+        if fear_greed_error:
+            worksheet.write(fg_start + 1, start_col, f"Fear & Greed data unavailable: {fear_greed_error}", text_fmt)
+            vix_start = fg_start + 4
+        else:
+            fg_headers = list(fear_greed_summary.columns)
+            for j, h in enumerate(fg_headers, start_col):
+                worksheet.write(fg_start + 1, j, h, header_white_fmt)
+            for i, row in fear_greed_summary.iterrows():
+                rr = fg_start + 2 + i
+                for j, h in enumerate(fg_headers, start_col):
+                    val = row[h]
+                    if h == "Score":
+                        worksheet.write_number(rr, j, float(val), number_fmt)
+                    else:
+                        worksheet.write(rr, j, str(val), text_fmt if h in ["Metric", "Rating", "Source"] else normal_fmt)
+            vix_start = fg_start + 5
+
+        # VIX block
+        worksheet.write(vix_start, start_col, "VIX percentile analysis", section_fmt)
+        if vix_error:
+            worksheet.write(vix_start + 1, start_col, f"VIX data unavailable: {vix_error}", text_fmt)
+            chart_start = vix_start + 4
+        else:
+            vix_headers = list(vix_summary.columns)
+            for j, h in enumerate(vix_headers, start_col):
+                worksheet.write(vix_start + 1, j, h, header_white_fmt)
+            for i, row in vix_summary.iterrows():
+                rr = vix_start + 2 + i
+                for j, h in enumerate(vix_headers, start_col):
+                    val = row[h]
+                    if h == "Period":
+                        worksheet.write(rr, j, val, text_fmt)
+                    elif h in ["Start Date", "End Date"]:
+                        worksheet.write(rr, j, str(val), normal_fmt)
+                    elif h == "Trading Days":
+                        worksheet.write_number(rr, j, int(val), int_fmt)
+                    elif h == "Percentile Rank":
+                        worksheet.write_number(rr, j, val / 100.0, pct_fmt)
+                    else:
+                        worksheet.write_number(rr, j, float(val), number_fmt)
+            chart_start = vix_start + 2 + len(vix_summary) + 3
+
+        _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_history, chart_start, start_col=start_col)
+
+        worksheet.set_column("B:B", 14)
+        worksheet.set_column("C:H", 12)
+        worksheet.set_column("I:N", 14)
+        worksheet.set_column("O:P", 15)
+        worksheet.freeze_panes(start_row + 1, 0)
+
+        # ====================================================
+        # ETF detail sheets, requested visual format
+        # ====================================================
+        for details in all_details:
+            if details.empty:
+                continue
+
+            etf_values = details["ETF"].dropna().astype(str).unique()
+            etf = etf_values[0] if len(etf_values) > 0 else f"ETF_{len(writer.sheets)}"
+
+            safe_sheet_base = (
+                etf.replace(".", "_").replace("/", "_").replace("\\", "_")
+                .replace("?", "_").replace("*", "_").replace("[", "_")
+                .replace("]", "_").replace(":", "_")
+            )
+            safe_sheet_base = safe_sheet_base[:31] if safe_sheet_base else f"ETF_{len(writer.sheets)}"
+            safe_sheet = safe_sheet_base
+            counter = 1
+            used_sheets_lower = {name.lower() for name in writer.sheets.keys()}
+            while safe_sheet.lower() in used_sheets_lower:
+                suffix = f"_{counter}"
+                safe_sheet = safe_sheet_base[:31 - len(suffix)] + suffix
+                counter += 1
+
+            detail = prepare_detail_sheet(details)
+            ws = workbook.add_worksheet(safe_sheet)
+            writer.sheets[safe_sheet] = ws
+
+            # Row 1 group headers, matching the screenshot layout.
+            ws.write(0, 0, report_date, group_header_fmt)
+            ws.write(0, 1, "Weight", group_header_fmt)
+            ws.write(0, 2, "YTD", group_header_fmt)
+            ws.merge_range(0, 3, 0, 6, "Analyst Target Return", group_header_fmt)
+            ws.write(0, 7, "", blank_no_border_fmt)
+            ws.write(0, 8, "Price", group_header_fmt)
+            ws.merge_range(0, 9, 0, 10, "PE ratio", group_header_fmt)
+            ws.merge_range(0, 11, 0, 13, "Growth", group_header_fmt)
+            ws.write(0, 14, "", blank_no_border_fmt)
+            ws.merge_range(0, 15, 0, 18, "12-month estimate price target", group_header_fmt)
+            ws.merge_range(0, 19, 0, 21, "EPS (Est Avg)", group_header_fmt)
+
+            # Row 2 column headers.
+            headers2 = [
+                etf, "% of Portfolio", "YTD", "Worst", "Average", "Median", "Best", "",
+                "Current", "Current", "Forward",
+                str(last_year), str(current_year), str(next_year), "",
+                "Worst", "Average", "Median", "Best",
+                str(last_year), str(current_year), str(next_year),
+            ]
+            for c, h in enumerate(headers2):
+                fmt = blank_no_border_fmt if c in [7, 14] else header_white_fmt
+                ws.write(1, c, h, fmt)
+
+            data_start = 2
+            for i, row in detail.iterrows():
+                r = data_start + i
+                ws.write(r, 0, row["Ticker"], text_fmt)
+                _write_number_or_dash(ws, r, 1, row["% of Portfolio"], pct_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 2, row["YTD"], pct_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 3, row["Worst"], pct_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 4, row["Average"], pct_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 5, row["Median"], pct_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 6, row["Best"], pct_fmt, normal_fmt)
+                ws.write(r, 7, "", blank_no_border_fmt)
+                _write_number_or_dash(ws, r, 8, row["Current"], money_red_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 9, row["Current PE"], number_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 10, row["Forward PE"], number_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 11, row["Growth Last Year"], pct_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 12, row["Growth This Year Est"], pct_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 13, row["Growth Next Year Est"], pct_fmt, normal_fmt)
+                ws.write(r, 14, row["Target Ticker"], text_fmt)
+                _write_number_or_dash(ws, r, 15, row["Worst Target"], money_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 16, row["Average Target"], money_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 17, row["Median Target"], money_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 18, row["Best Target"], money_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 19, row["EPS Last Year"], number_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 20, row["EPS This Year Est Avg"], number_fmt, normal_fmt)
+                _write_number_or_dash(ws, r, 21, row["EPS Next Year Est Avg"], number_fmt, normal_fmt)
+
+            total_row = data_start + len(detail) + 2
+            first_excel_row = data_start + 1
+            last_excel_row = data_start + len(detail)
+            ws.write(total_row, 0, "TOTAL", total_text_fmt)
+            ws.write_formula(total_row, 1, f"=SUM(B{first_excel_row}:B{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 2, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},C{first_excel_row}:C{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 3, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},D{first_excel_row}:D{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 4, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},E{first_excel_row}:E{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 5, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},F{first_excel_row}:F{last_excel_row})", total_pct_fmt)
+            ws.write_formula(total_row, 6, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},G{first_excel_row}:G{last_excel_row})", total_pct_fmt)
+
+            # Color negative / high values similar to existing style.
+            ws.conditional_format(f"C3:G{last_excel_row}", {"type": "cell", "criteria": "<", "value": 0, "format": pct_red_fmt})
+            ws.conditional_format(f"C3:G{last_excel_row}", {"type": "cell", "criteria": ">=", "value": 0.3, "format": pct_green_fill_fmt})
+            ws.conditional_format(f"L3:N{last_excel_row}", {"type": "cell", "criteria": "<", "value": 0, "format": pct_red_fmt})
+            ws.conditional_format(f"L3:N{last_excel_row}", {"type": "cell", "criteria": ">=", "value": 0.3, "format": pct_green_fill_fmt})
+
+            ws.freeze_panes(2, 1)
+            ws.set_column("A:A", 11)
+            ws.set_column("B:B", 14)
+            ws.set_column("C:G", 11)
+            ws.set_column("H:H", 3)
+            ws.set_column("I:I", 12)
+            ws.set_column("J:K", 11)
+            ws.set_column("L:N", 11)
+            ws.set_column("O:O", 11)
+            ws.set_column("P:S", 12)
+            ws.set_column("T:V", 11)
+            ws.set_default_row(18)
+
+        print(f"Saved Excel report: {output_path}")
+        return output_path
+
+
+_ORIGINAL_MAIN_WITH_EXCEL_V4_BASE = main_with_excel
+
+def main_with_excel():
+    print(f"ETF analyst report version: {REPORT_VERSION}")
+    all_details = []
+    summaries = []
+    failures = []
+
+    for etf in ETFS:
+        try:
+            details, summary = run_one_etf(etf)
+            all_details.append(details)
+            summaries.append(summary)
+        except Exception as e:
+            print("\n" + "!" * 72)
+            print(f"FAILED: {etf}")
+            print(repr(e))
+            print("!" * 72)
+            failures.append({"ETF": etf, "Error": repr(e)})
+
+    if summaries and all_details:
+        pe_history = update_pe_history(summaries)
+        export_excel_report(all_details, summaries, pe_history=pe_history)
+
+    if failures:
+        print("\nFailures:")
+        for f in failures:
+            print(f"{f['ETF']}: {f['Error']}")
+
+    return all_details, summaries, failures
+
 # ============================================================
 # SCRIPT RUN
 # ============================================================
