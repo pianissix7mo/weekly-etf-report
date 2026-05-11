@@ -1582,7 +1582,7 @@ def build_fear_greed_summary():
 # EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-REPORT_VERSION = "pe-history-graphs-layout-v5-clean"
+REPORT_VERSION = "pe-history-graphs-layout-v8-hardcoded-summary-k-l"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
 REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
@@ -1877,28 +1877,52 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         worksheet = workbook.add_worksheet("Summary")
         writer.sheets["Summary"] = worksheet
 
-        headers = ["", "reliable", "YTD", "Average", "Median", "WORST", "BEST", "Current pr", "worst price", "PE Ratio", "PE coverage", "Forward PE", "Forward PE coverage"]
+        # Summary sheet column layout is intentionally explicit.
+        # Excel columns:
+        # B ETF/date, C reliable, D YTD, E Average, F Median, G WORST, H BEST,
+        # I Current pr, J worst price, K PE Ratio, L Forward PE,
+        # M PE coverage, N Forward PE coverage.
         start_row = 3
         start_col = 1
+        summary_columns = [
+            ("B", report_date, None, header_fmt),
+            ("C", "reliable", "reliable", pct_fmt),
+            ("D", "YTD", "YTD", pct_fmt),
+            ("E", "Average", "Average", pct_fmt),
+            ("F", "Median", "Median", pct_fmt),
+            ("G", "WORST", "WORST", pct_fmt),
+            ("H", "BEST", "BEST", pct_fmt),
+            ("I", "Current pr", "Current pr", money_fmt),
+            ("J", "worst price", "worst price", money_red_fmt),
+            ("K", "PE Ratio", "PE Ratio", number_fmt),
+            ("L", "Forward PE", "Forward PE", number_fmt),
+            ("M", "PE coverage", "PE coverage", pct_fmt),
+            ("N", "Forward PE coverage", "Forward PE coverage", pct_fmt),
+        ]
+
+        worksheet.write(0, 1, "Summary order check: K=PE Ratio, L=Forward PE, M=PE coverage, N=Forward PE coverage", section_fmt)
         worksheet.write(start_row, start_col, report_date, header_fmt)
-        for j, h in enumerate(headers[1:], start_col + 1):
-            worksheet.write(start_row, j, h, header_white_fmt)
+        for offset, (_excel_col, label, _key, _fmt) in enumerate(summary_columns[1:], start=1):
+            worksheet.write(start_row, start_col + offset, label, header_white_fmt)
+
+        # Hard override for Summary header cells. 0-indexed columns: K=10, L=11, M=12, N=13.
+        worksheet.write(start_row, 10, "PE Ratio", header_white_fmt)
+        worksheet.write(start_row, 11, "Forward PE", header_white_fmt)
+        worksheet.write(start_row, 12, "PE coverage", header_white_fmt)
+        worksheet.write(start_row, 13, "Forward PE coverage", header_white_fmt)
 
         for i, row in summary_rows.iterrows():
             r = start_row + 1 + i
             worksheet.write(r, start_col, row["ETF"], text_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 1, row["reliable"], pct_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 2, row["YTD"], pct_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 3, row["Average"], pct_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 4, row["Median"], pct_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 5, row["WORST"], pct_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 6, row["BEST"], pct_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 7, row["Current pr"], money_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 8, row["worst price"], money_red_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 9, row["PE Ratio"], number_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 10, row["PE coverage"], pct_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 11, row["Forward PE"], number_fmt, normal_fmt)
-            _write_number_or_dash(worksheet, r, start_col + 12, row["Forward PE coverage"], pct_fmt, normal_fmt)
+            for offset, (_excel_col, _label, key, value_fmt) in enumerate(summary_columns[1:], start=1):
+                _write_number_or_dash(worksheet, r, start_col + offset, row[key], value_fmt, normal_fmt)
+
+            # Hard override for Summary value cells. This prevents any earlier layout code from keeping
+            # Forward PE separated from PE Ratio.
+            _write_number_or_dash(worksheet, r, 10, row["PE Ratio"], number_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, 11, row["Forward PE"], number_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, 12, row["PE coverage"], pct_fmt, normal_fmt)
+            _write_number_or_dash(worksheet, r, 13, row["Forward PE coverage"], pct_fmt, normal_fmt)
 
         end_row = start_row + len(summary_rows)
         worksheet.conditional_format(f"D5:H{end_row + 1}", {"type": "cell", "criteria": "<", "value": 0, "format": pct_red_fmt})
