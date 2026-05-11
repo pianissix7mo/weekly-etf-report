@@ -33,7 +33,7 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run ETF analyst report
-        run: python etf_analyst_report_pe_history_graphs_v4.py
+        run: etf_analyst_report_complete.py
 
       - name: Commit PE history and latest report
         run: |
