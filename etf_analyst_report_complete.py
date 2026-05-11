@@ -947,6 +947,30 @@ def get_ytd_return_from_yahoo(symbol):
     except Exception: return None
 
 
+def get_last_calendar_year_stock_return_from_yahoo(symbol):
+    """
+    Last calendar year stock growth/return.
+
+    Uses yfinance with auto_adjust=True, so prices are adjusted for splits,
+    reverse splits, and dividends. This avoids false jumps from stock splits
+    or share consolidations.
+    """
+    try:
+        today = pd.Timestamp.now(tz="America/Toronto")
+        last_year = today.year - 1
+        start = f"{last_year}-01-01"
+        end = f"{today.year}-01-01"
+        hist = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True)
+        if hist is None or hist.empty or "Close" not in hist.columns: return None
+        closes = hist["Close"].dropna()
+        if len(closes) < 2: return None
+        first_close = closes.iloc[0]
+        last_close = closes.iloc[-1]
+        if first_close is None or pd.isna(first_close) or first_close == 0: return None
+        return float(last_close / first_close - 1)
+    except Exception: return None
+
+
 def get_yf_dataframe(ticker_obj, names):
     for name in names:
         try:
@@ -1045,9 +1069,11 @@ def get_eps_estimates_from_yfinance(ticker_obj):
 def get_growth_estimates_from_yfinance(ticker_obj):
     """
     Yahoo Finance Analysis -> Growth Estimates.
-    Growth Last Year: tries -1Y / last year, then falls back to -5Y / Past 5 Years.
-    Growth This Year Est: Current Year / 0Y.
-    Growth Next Year Est: Next Year / +1Y.
+
+    Used for Growth This Year Est and Growth Next Year Est.
+    Growth Last Year is calculated separately from last calendar year's
+    split-adjusted stock return, because Yahoo usually does not provide a true
+    last-year row in Growth Estimates.
     """
     df = get_yf_dataframe(ticker_obj, ["get_growth_estimates", "growth_estimates"])
     if df.empty: return None, None, None
@@ -1076,12 +1102,12 @@ def get_growth_estimates_from_yfinance(ticker_obj):
 def get_eps_and_growth_data(ticker_obj):
     eps_last_year = get_annual_eps_from_financials(ticker_obj)
     eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
-    growth_last_year, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
+    _unused_growth_last_year, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
     return {
         "EPS Last Year": eps_last_year,
         "EPS This Year Est Avg": eps_this_year,
         "EPS Next Year Est Avg": eps_next_year,
-        "Growth Last Year": growth_last_year,
+        "Growth Last Year": None,
         "Growth This Year Est": growth_this_year,
         "Growth Next Year Est": growth_next_year,
     }
@@ -1116,7 +1142,12 @@ def pull_yahoo_targets(symbol):
             out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
             out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
         out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
-        try: out.update(get_eps_and_growth_data(t))
+        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
+        try:
+            out.update(get_eps_and_growth_data(t))
+            # Override with calculated last-calendar-year stock return.
+            # Yahoo Growth Estimates usually has Past 5 Years, not true last year.
+            out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
         except Exception as e: out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
     except Exception as e: out["Yahoo Error"] = str(e)
     return out
@@ -1404,6 +1435,849 @@ def main_with_excel():
 
 
 def main(): return main_with_excel()
+
+
+# ============================================================
+# FINAL HOTFIX: Growth Last Year = last calendar year stock return
+# This block intentionally overrides previous functions.
+# ============================================================
+
+def _history_close_series_for_return(symbol, start_date, end_date):
+    """
+    Robust adjusted close history getter.
+    Tries Ticker.history, period fallback, and yf.download.
+    Uses adjusted prices so splits/reverse splits do not create fake returns.
+    """
+    symbols_to_try = [str(symbol).strip()]
+    s0 = symbols_to_try[0]
+
+    # Yahoo normally uses BRK-B, BF-B, etc. for US share classes.
+    # Do not change exchange suffixes such as .TO, .HK, .T, .KS.
+    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s0):
+        symbols_to_try.append(s0.replace(".", "-"))
+
+    for sym in dict.fromkeys(symbols_to_try):
+        try:
+            hist = yf.Ticker(sym).history(
+                start=str(start_date.date() if hasattr(start_date, "date") else start_date),
+                end=str(end_date.date() if hasattr(end_date, "date") else end_date),
+                auto_adjust=True,
+                actions=False,
+            )
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+                if len(close) >= 2:
+                    return close
+        except Exception:
+            pass
+
+        try:
+            hist = yf.Ticker(sym).history(period="3y", auto_adjust=True, actions=False)
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                tmp = hist.copy()
+                idx = pd.to_datetime(tmp.index, errors="coerce")
+                try:
+                    idx = idx.tz_localize(None)
+                except Exception:
+                    try:
+                        idx = idx.tz_convert(None)
+                    except Exception:
+                        pass
+                tmp.index = idx
+                tmp = tmp[(tmp.index >= pd.Timestamp(start_date)) & (tmp.index < pd.Timestamp(end_date))]
+                close = pd.to_numeric(tmp["Close"], errors="coerce").dropna()
+                if len(close) >= 2:
+                    return close
+        except Exception:
+            pass
+
+        try:
+            hist = yf.download(
+                sym,
+                start=str(start_date.date() if hasattr(start_date, "date") else start_date),
+                end=str(end_date.date() if hasattr(end_date, "date") else end_date),
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            if hist is not None and not hist.empty:
+                if isinstance(hist.columns, pd.MultiIndex):
+                    close_cols = [c for c in hist.columns if c[0] == "Close"]
+                    close = hist[close_cols[0]] if close_cols else None
+                else:
+                    close = hist["Close"] if "Close" in hist.columns else None
+                if close is not None:
+                    close = pd.to_numeric(close, errors="coerce").dropna()
+                    if len(close) >= 2:
+                        return close
+        except Exception:
+            pass
+
+    return pd.Series(dtype=float)
+
+
+def get_last_calendar_year_stock_return_from_yahoo(symbol):
+    """
+    Last calendar year stock return/growth.
+    Example: if today is in 2026, this calculates 2025 return.
+    Uses adjusted prices, so stock splits/reverse splits are handled.
+    """
+    try:
+        today = pd.Timestamp.now(tz="America/Toronto")
+        last_year = today.year - 1
+        start = pd.Timestamp(year=last_year, month=1, day=1)
+        end = pd.Timestamp(year=today.year, month=1, day=1)
+
+        close = _history_close_series_for_return(symbol, start, end)
+        if close is None or len(close) < 2:
+            return None
+
+        first_close = safe_float_value(close.iloc[0])
+        last_close = safe_float_value(close.iloc[-1])
+        if first_close is None or first_close == 0 or last_close is None:
+            return None
+
+        return float(last_close / first_close - 1)
+    except Exception:
+        return None
+
+
+def get_eps_and_growth_data(ticker_obj):
+    """
+    EPS:
+    - EPS Last Year from annual financials
+    - EPS This Year Est Avg from Yahoo earnings estimate
+    - EPS Next Year Est Avg from Yahoo earnings estimate
+
+    Growth:
+    - Growth This Year Est and Growth Next Year Est from Yahoo Finance Analysis -> Growth Estimates
+    - Growth Last Year is calculated separately from adjusted historical price in pull_yahoo_targets().
+    """
+    eps_last_year = get_annual_eps_from_financials(ticker_obj)
+    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
+    _unused_growth_last_year, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
+    return {
+        "EPS Last Year": eps_last_year,
+        "EPS This Year Est Avg": eps_this_year,
+        "EPS Next Year Est Avg": eps_next_year,
+        "Growth This Year Est": growth_this_year,
+        "Growth Next Year Est": growth_next_year,
+    }
+
+
+def pull_yahoo_targets(symbol):
+    out = {
+        "Yahoo Ticker": symbol,
+        "Current Price": None,
+        "Target Low": None,
+        "Target Mean": None,
+        "Target High": None,
+        "Target Median": None,
+        "Analyst Count": None,
+        "Trailing PE": None,
+        "Forward PE": None,
+        "YTD Return": None,
+        "EPS Last Year": None,
+        "EPS This Year Est Avg": None,
+        "EPS Next Year Est Avg": None,
+        "Growth Last Year": None,
+        "Growth This Year Est": None,
+        "Growth Next Year Est": None,
+        "Yahoo Error": None,
+    }
+    try:
+        t = yf.Ticker(symbol)
+
+        try:
+            targets = t.get_analyst_price_targets()
+            if isinstance(targets, dict):
+                out.update({
+                    "Target Low": targets.get("low"),
+                    "Target Mean": targets.get("mean"),
+                    "Target High": targets.get("high"),
+                    "Target Median": targets.get("median"),
+                    "Analyst Count": targets.get("numberOfAnalysts"),
+                })
+            elif isinstance(targets, pd.DataFrame) and not targets.empty:
+                row = targets.iloc[0]
+                out.update({
+                    "Target Low": row.get("low"),
+                    "Target Mean": row.get("mean"),
+                    "Target High": row.get("high"),
+                    "Target Median": row.get("median"),
+                    "Analyst Count": row.get("numberOfAnalysts"),
+                })
+        except Exception as e:
+            out["Yahoo Error"] = f"target error: {e}"
+
+        try:
+            fast = t.fast_info
+            out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
+        except Exception:
+            pass
+
+        if out["Current Price"] is None or pd.isna(out["Current Price"]):
+            try:
+                hist = t.history(period="5d", auto_adjust=False)
+                if hist is not None and not hist.empty:
+                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
+            except Exception:
+                pass
+
+        try:
+            info = t.get_info()
+        except Exception:
+            try:
+                info = t.info
+            except Exception:
+                info = {}
+
+        if isinstance(info, dict):
+            out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
+            out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
+
+        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
+
+        # Important fix: historical adjusted stock return, not Yahoo Growth Estimates.
+        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
+
+        try:
+            out.update(get_eps_and_growth_data(t))
+        except Exception as e:
+            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
+
+        # Re-apply so it cannot be overwritten by any update() call.
+        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
+
+    except Exception as e:
+        out["Yahoo Error"] = str(e)
+    return out
+
+
+# ============================================================
+# FINAL FINAL HOTFIX: Growth Last Year = robust adjusted stock price return
+# Inserted before SCRIPT RUN so it is active when running this .py file.
+# ============================================================
+
+def _normalize_history_close_for_growth(hist):
+    """
+    Return an adjusted close Series from yfinance output.
+    With auto_adjust=True, Close is adjusted for splits/dividends.
+    If Adj Close exists, use Adj Close.
+    """
+    try:
+        if hist is None or hist.empty:
+            return pd.Series(dtype=float)
+
+        if isinstance(hist.columns, pd.MultiIndex):
+            # Prefer Adj Close if present, otherwise Close.
+            adj_cols = [c for c in hist.columns if str(c[0]).lower() == "adj close"]
+            close_cols = [c for c in hist.columns if str(c[0]).lower() == "close"]
+            chosen = adj_cols[0] if adj_cols else (close_cols[0] if close_cols else None)
+            if chosen is None:
+                return pd.Series(dtype=float)
+            close = hist[chosen]
+        else:
+            if "Adj Close" in hist.columns:
+                close = hist["Adj Close"]
+            elif "Close" in hist.columns:
+                close = hist["Close"]
+            else:
+                return pd.Series(dtype=float)
+
+        close = pd.to_numeric(close, errors="coerce").dropna()
+        if close.empty:
+            return pd.Series(dtype=float)
+
+        idx = pd.to_datetime(close.index, errors="coerce")
+        try:
+            idx = idx.tz_localize(None)
+        except Exception:
+            try:
+                idx = idx.tz_convert(None)
+            except Exception:
+                pass
+
+        close.index = idx
+        close = close[~close.index.isna()].sort_index()
+        return close
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _ticker_variants_for_yahoo(symbol):
+    s = str(symbol).strip()
+    variants = [s]
+
+    # Yahoo usually uses BRK-B / BF-B, while holdings sometimes show BRK.B / BF.B.
+    # Do not touch exchange suffixes like .TO, .HK, .T, .KS.
+    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s.upper()):
+        variants.append(s.replace(".", "-"))
+
+    return list(dict.fromkeys(variants))
+
+
+def _get_adjusted_close_history_for_growth(symbol):
+    """
+    Robust adjusted history getter. This uses several yfinance paths.
+    It returns a close series adjusted for splits/reverse splits.
+    """
+    for sym in _ticker_variants_for_yahoo(symbol):
+        # Most reliable: period download, then filter ourselves.
+        for period in ["3y", "5y", "2y"]:
+            try:
+                hist = yf.Ticker(sym).history(period=period, auto_adjust=True, actions=False)
+                close = _normalize_history_close_for_growth(hist)
+                if len(close) >= 2:
+                    return close
+            except Exception:
+                pass
+
+            try:
+                hist = yf.download(sym, period=period, auto_adjust=True, progress=False, threads=False)
+                close = _normalize_history_close_for_growth(hist)
+                if len(close) >= 2:
+                    return close
+            except Exception:
+                pass
+
+        # Date-range fallback.
+        try:
+            today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+        except Exception:
+            today = pd.Timestamp.today()
+
+        start = today - pd.DateOffset(years=3)
+        end = today + pd.Timedelta(days=1)
+        try:
+            hist = yf.Ticker(sym).history(
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                auto_adjust=True,
+                actions=False,
+            )
+            close = _normalize_history_close_for_growth(hist)
+            if len(close) >= 2:
+                return close
+        except Exception:
+            pass
+
+    return pd.Series(dtype=float)
+
+
+def _price_on_or_after(close, dt, max_days=21):
+    try:
+        dt = pd.Timestamp(dt).tz_localize(None)
+    except Exception:
+        dt = pd.Timestamp(dt)
+
+    sub = close[close.index >= dt]
+    if sub.empty:
+        return None
+
+    if (sub.index[0] - dt).days > max_days:
+        return None
+
+    return safe_float_value(sub.iloc[0])
+
+
+def _price_on_or_before(close, dt, max_days=21):
+    try:
+        dt = pd.Timestamp(dt).tz_localize(None)
+    except Exception:
+        dt = pd.Timestamp(dt)
+
+    sub = close[close.index <= dt]
+    if sub.empty:
+        return None
+
+    if (dt - sub.index[-1]).days > max_days:
+        return None
+
+    return safe_float_value(sub.iloc[-1])
+
+
+def get_last_calendar_year_stock_return_from_yahoo(symbol):
+    """
+    Growth Last Year = previous full calendar-year stock return.
+
+    Example: if run in 2026, this calculates 2025 return:
+        adjusted close near Dec 31, 2025 / adjusted close near Jan 1, 2025 - 1
+
+    Uses adjusted prices, so stock splits/reverse splits are handled.
+    If previous-calendar-year data is unavailable, it falls back to trailing 1-year return.
+    """
+    try:
+        close = _get_adjusted_close_history_for_growth(symbol)
+        if close is None or len(close) < 2:
+            return None
+
+        try:
+            today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+        except Exception:
+            today = pd.Timestamp.today()
+
+        last_year = today.year - 1
+        start_dt = pd.Timestamp(year=last_year, month=1, day=1)
+        end_dt = pd.Timestamp(year=today.year, month=1, day=1) - pd.Timedelta(days=1)
+
+        start_price = _price_on_or_after(close, start_dt, max_days=21)
+        end_price = _price_on_or_before(close, end_dt, max_days=21)
+
+        if start_price not in [None, 0] and end_price is not None:
+            return float(end_price / start_price - 1)
+
+        # Fallback: trailing 1-year return to latest available close.
+        latest_date = close.index[-1]
+        latest_price = safe_float_value(close.iloc[-1])
+        one_year_ago = latest_date - pd.DateOffset(years=1)
+        start_price = _price_on_or_after(close, one_year_ago, max_days=21)
+
+        if start_price not in [None, 0] and latest_price is not None:
+            return float(latest_price / start_price - 1)
+
+        return None
+    except Exception:
+        return None
+
+
+def pull_yahoo_targets(symbol):
+    out = {
+        "Yahoo Ticker": symbol,
+        "Current Price": None,
+        "Target Low": None,
+        "Target Mean": None,
+        "Target High": None,
+        "Target Median": None,
+        "Analyst Count": None,
+        "Trailing PE": None,
+        "Forward PE": None,
+        "YTD Return": None,
+        "EPS Last Year": None,
+        "EPS This Year Est Avg": None,
+        "EPS Next Year Est Avg": None,
+        "Growth Last Year": None,
+        "Growth This Year Est": None,
+        "Growth Next Year Est": None,
+        "Yahoo Error": None,
+    }
+
+    try:
+        t = yf.Ticker(symbol)
+
+        try:
+            targets = t.get_analyst_price_targets()
+            if isinstance(targets, dict):
+                out.update({
+                    "Target Low": targets.get("low"),
+                    "Target Mean": targets.get("mean"),
+                    "Target High": targets.get("high"),
+                    "Target Median": targets.get("median"),
+                    "Analyst Count": targets.get("numberOfAnalysts"),
+                })
+            elif isinstance(targets, pd.DataFrame) and not targets.empty:
+                row = targets.iloc[0]
+                out.update({
+                    "Target Low": row.get("low"),
+                    "Target Mean": row.get("mean"),
+                    "Target High": row.get("high"),
+                    "Target Median": row.get("median"),
+                    "Analyst Count": row.get("numberOfAnalysts"),
+                })
+        except Exception as e:
+            out["Yahoo Error"] = f"target error: {e}"
+
+        try:
+            fast = t.fast_info
+            out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
+        except Exception:
+            pass
+
+        if out["Current Price"] is None or pd.isna(out["Current Price"]):
+            try:
+                hist = t.history(period="5d", auto_adjust=False)
+                if hist is not None and not hist.empty:
+                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
+            except Exception:
+                pass
+
+        try:
+            info = t.get_info()
+        except Exception:
+            try:
+                info = t.info
+            except Exception:
+                info = {}
+
+        if isinstance(info, dict):
+            out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
+            out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
+
+        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
+
+        try:
+            out.update(get_eps_and_growth_data(t))
+        except Exception as e:
+            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
+
+        # Hard override AFTER EPS/growth update so Yahoo Growth Estimates cannot blank it.
+        last_growth = get_last_calendar_year_stock_return_from_yahoo(symbol)
+        out["Growth Last Year"] = last_growth
+        if last_growth is None:
+            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + "Growth Last Year unavailable from adjusted price history"
+
+    except Exception as e:
+        out["Yahoo Error"] = str(e)
+
+    return out
+
+
+# ============================================================
+# VERIFIED HOTFIX v3: Growth Last Year = adjusted stock return
+# This block intentionally comes LAST, right before SCRIPT RUN.
+# It overrides earlier versions and fills blanks again after merge.
+# ============================================================
+
+REPORT_VERSION = "growth-last-year-adjusted-price-v3"
+
+
+def _growth_v3_ticker_variants(symbol):
+    s = str(symbol).strip()
+    variants = [s]
+
+    # Yahoo often uses BRK-B, while holdings can show BRK.B.
+    # Do not rewrite exchange suffixes like .TO, .HK, .T, .KS.
+    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s.upper()):
+        variants.append(s.replace(".", "-"))
+
+    return list(dict.fromkeys(variants))
+
+
+def _growth_v3_close_series(hist):
+    """Return a cleaned adjusted close series from yfinance output."""
+    try:
+        if hist is None or hist.empty:
+            return pd.Series(dtype=float)
+
+        if isinstance(hist.columns, pd.MultiIndex):
+            adj_cols = [c for c in hist.columns if str(c[0]).lower() == "adj close"]
+            close_cols = [c for c in hist.columns if str(c[0]).lower() == "close"]
+            chosen = adj_cols[0] if adj_cols else (close_cols[0] if close_cols else None)
+            if chosen is None:
+                return pd.Series(dtype=float)
+            close = hist[chosen]
+        else:
+            if "Adj Close" in hist.columns:
+                close = hist["Adj Close"]
+            elif "Close" in hist.columns:
+                close = hist["Close"]
+            else:
+                return pd.Series(dtype=float)
+
+        close = pd.to_numeric(close, errors="coerce").dropna()
+        if close.empty:
+            return pd.Series(dtype=float)
+
+        idx = pd.to_datetime(close.index, errors="coerce")
+        try:
+            idx = idx.tz_localize(None)
+        except Exception:
+            try:
+                idx = idx.tz_convert(None)
+            except Exception:
+                pass
+
+        close.index = idx
+        close = close[~close.index.isna()].sort_index()
+        return close
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _growth_v3_download_close(symbol, start, end):
+    """Try several yfinance paths. Returns split/dividend adjusted close because auto_adjust=True."""
+    for sym in _growth_v3_ticker_variants(symbol):
+        # Date-range method.
+        for method in ["ticker_history", "download"]:
+            try:
+                if method == "ticker_history":
+                    hist = yf.Ticker(sym).history(
+                        start=pd.Timestamp(start).strftime("%Y-%m-%d"),
+                        end=pd.Timestamp(end).strftime("%Y-%m-%d"),
+                        auto_adjust=True,
+                        actions=False,
+                    )
+                else:
+                    hist = yf.download(
+                        sym,
+                        start=pd.Timestamp(start).strftime("%Y-%m-%d"),
+                        end=pd.Timestamp(end).strftime("%Y-%m-%d"),
+                        auto_adjust=True,
+                        progress=False,
+                        threads=False,
+                    )
+                close = _growth_v3_close_series(hist)
+                if len(close) >= 2:
+                    return close
+            except Exception:
+                pass
+
+        # Period fallback, then filter ourselves.
+        for period in ["3y", "5y", "2y"]:
+            for method in ["ticker_history", "download"]:
+                try:
+                    if method == "ticker_history":
+                        hist = yf.Ticker(sym).history(period=period, auto_adjust=True, actions=False)
+                    else:
+                        hist = yf.download(sym, period=period, auto_adjust=True, progress=False, threads=False)
+                    close = _growth_v3_close_series(hist)
+                    if len(close) >= 2:
+                        start_ts = pd.Timestamp(start)
+                        end_ts = pd.Timestamp(end)
+                        close = close[(close.index >= start_ts) & (close.index < end_ts)]
+                        if len(close) >= 2:
+                            return close
+                except Exception:
+                    pass
+
+    return pd.Series(dtype=float)
+
+
+def get_last_calendar_year_stock_return_from_yahoo(symbol):
+    """
+    Growth Last Year = previous full calendar-year stock return.
+
+    Example: if run in 2026, this calculates 2025 return:
+        last adjusted close in 2025 / first adjusted close in 2025 - 1
+
+    auto_adjust=True handles splits/reverse splits.
+    If a stock did not trade for enough of last year, falls back to trailing 1-year adjusted return.
+    """
+    try:
+        today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+    except Exception:
+        today = pd.Timestamp.today()
+
+    last_year = today.year - 1
+    start = pd.Timestamp(year=last_year, month=1, day=1)
+    end = pd.Timestamp(year=today.year, month=1, day=1)
+
+    try:
+        close = _growth_v3_download_close(symbol, start, end)
+        if len(close) >= 2:
+            first_price = safe_float_value(close.iloc[0])
+            last_price = safe_float_value(close.iloc[-1])
+            if first_price not in [None, 0] and last_price is not None:
+                return float(last_price / first_price - 1)
+    except Exception:
+        pass
+
+    # Fallback: trailing 1-year adjusted return.
+    try:
+        end2 = today + pd.Timedelta(days=1)
+        start2 = today - pd.DateOffset(years=1)
+        close = _growth_v3_download_close(symbol, start2, end2)
+        if len(close) >= 2:
+            first_price = safe_float_value(close.iloc[0])
+            last_price = safe_float_value(close.iloc[-1])
+            if first_price not in [None, 0] and last_price is not None:
+                return float(last_price / first_price - 1)
+    except Exception:
+        pass
+
+    return None
+
+
+# Keep this name, but make it only return Yahoo Analysis Growth Estimates for this/next year.
+def get_eps_and_growth_data(ticker_obj):
+    eps_last_year = get_annual_eps_from_financials(ticker_obj)
+    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
+    _ignore_last, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
+
+    return {
+        "EPS Last Year": eps_last_year,
+        "EPS This Year Est Avg": eps_this_year,
+        "EPS Next Year Est Avg": eps_next_year,
+        "Growth This Year Est": growth_this_year,
+        "Growth Next Year Est": growth_next_year,
+    }
+
+
+def pull_yahoo_targets(symbol):
+    out = {
+        "Yahoo Ticker": symbol,
+        "Current Price": None,
+        "Target Low": None,
+        "Target Mean": None,
+        "Target High": None,
+        "Target Median": None,
+        "Analyst Count": None,
+        "Trailing PE": None,
+        "Forward PE": None,
+        "YTD Return": None,
+        "EPS Last Year": None,
+        "EPS This Year Est Avg": None,
+        "EPS Next Year Est Avg": None,
+        "Growth Last Year": None,
+        "Growth This Year Est": None,
+        "Growth Next Year Est": None,
+        "Yahoo Error": None,
+    }
+
+    try:
+        t = yf.Ticker(symbol)
+
+        try:
+            targets = t.get_analyst_price_targets()
+            if isinstance(targets, dict):
+                out["Target Low"] = targets.get("low")
+                out["Target Mean"] = targets.get("mean")
+                out["Target High"] = targets.get("high")
+                out["Target Median"] = targets.get("median")
+                out["Analyst Count"] = targets.get("numberOfAnalysts")
+            elif isinstance(targets, pd.DataFrame) and not targets.empty:
+                row = targets.iloc[0]
+                out["Target Low"] = row.get("low")
+                out["Target Mean"] = row.get("mean")
+                out["Target High"] = row.get("high")
+                out["Target Median"] = row.get("median")
+                out["Analyst Count"] = row.get("numberOfAnalysts")
+        except Exception as e:
+            out["Yahoo Error"] = f"target error: {e}"
+
+        try:
+            fast = t.fast_info
+            out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
+        except Exception:
+            pass
+
+        if out["Current Price"] is None or pd.isna(out["Current Price"]):
+            try:
+                hist = t.history(period="5d", auto_adjust=False)
+                if hist is not None and not hist.empty:
+                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
+            except Exception:
+                pass
+
+        try:
+            info = t.get_info()
+        except Exception:
+            try:
+                info = t.info
+            except Exception:
+                info = {}
+
+        if isinstance(info, dict):
+            out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
+            out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
+
+        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
+
+        try:
+            out.update(get_eps_and_growth_data(t))
+        except Exception as e:
+            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
+
+        # Final hard assignment after all updates. This cannot be overwritten by Yahoo Growth Estimates.
+        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
+        if out["Growth Last Year"] is None:
+            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + "Growth Last Year unavailable from adjusted price history"
+
+    except Exception as e:
+        out["Yahoo Error"] = str(e)
+
+    return out
+
+
+def add_yahoo_targets(holdings):
+    rows = []
+    symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
+
+    for i, symbol in enumerate(symbols, 1):
+        print(f"Yahoo targets + PE + YTD + EPS + Growth {i}/{len(symbols)}: {symbol}")
+        rows.append(pull_yahoo_targets(symbol))
+        time.sleep(YAHOO_SLEEP_SECONDS)
+
+    targets = pd.DataFrame(rows)
+    merged = holdings.merge(targets, on="Yahoo Ticker", how="left")
+
+    numeric_cols = [
+        "Current Price", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count",
+        "Trailing PE", "Forward PE", "YTD Return",
+        "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg",
+        "Growth Last Year", "Growth This Year Est", "Growth Next Year Est",
+    ]
+
+    for c in numeric_cols:
+        if c in merged.columns:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+
+    # Absolute final guard: if any row is still blank, try adjusted price history again by ticker.
+    if "Growth Last Year" in merged.columns:
+        missing = merged["Growth Last Year"].isna()
+        if missing.any():
+            for sym in merged.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
+                val = get_last_calendar_year_stock_return_from_yahoo(sym)
+                if val is not None:
+                    merged.loc[merged["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
+
+    return merged
+
+
+def prepare_detail_sheet(details):
+    df = details.copy()
+
+    # Final display guard: calculate Growth Last Year right before writing Excel if still missing.
+    if "Growth Last Year" not in df.columns:
+        df["Growth Last Year"] = np.nan
+    if "Yahoo Ticker" in df.columns:
+        missing = df["Growth Last Year"].isna()
+        if missing.any():
+            for sym in df.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
+                val = get_last_calendar_year_stock_return_from_yahoo(sym)
+                if val is not None:
+                    df.loc[df["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
+
+    out = pd.DataFrame()
+    out["Ticker"] = df["Yahoo Ticker"]
+    out["% of Portfolio"] = df["Weight Decimal"]
+    out["YTD"] = df["YTD Return"]
+    out["Worst"] = df["Low Return"]
+    out["Average"] = df["Mean Return"]
+    out["Median"] = df["Median Return"]
+    out["Best"] = df["High Return"]
+
+    out["Worst Target"] = df["Target Low"]
+    out["Average Target"] = df["Target Mean"]
+    out["Median Target"] = df["Target Median"]
+    out["Best Target"] = df["Target High"]
+    out["Current"] = df["Current Price"]
+
+    out["Current PE"] = df["Trailing PE"]
+    out["Forward PE"] = df["Forward PE"]
+
+    out["EPS Last Year"] = df["EPS Last Year"]
+    out["EPS This Year Est Avg"] = df["EPS This Year Est Avg"]
+    out["EPS Next Year Est Avg"] = df["EPS Next Year Est Avg"]
+
+    out["Growth Last Year"] = df["Growth Last Year"]
+    out["Growth This Year Est"] = df["Growth This Year Est"]
+    out["Growth Next Year Est"] = df["Growth Next Year Est"]
+
+    out = out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
+    return out
+
+
+_ORIGINAL_MAIN_WITH_EXCEL_V3 = main_with_excel
+
+def main_with_excel():
+    print(f"ETF analyst report version: {REPORT_VERSION}")
+    return _ORIGINAL_MAIN_WITH_EXCEL_V3()
+
+
+# ============================================================
+# SCRIPT RUN
+# ============================================================
 
 if __name__ == "__main__":
     main_with_excel()
