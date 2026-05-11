@@ -37,9 +37,9 @@ jobs:
         env:
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: 465
-          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_USER: pianissix7mo@gmail.com
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: ${{ secrets.SMTP_USER }}
+          EMAIL_FROM: pianissix7mo@gmail.com
           EMAIL_TO: mofeiwang@hotmail.com,mofeiwang@yahoo.ca
         run: python send_etf_report_email.py
 
