@@ -72,9 +72,13 @@ ETF_CONFIG = {
     "CHPS.TO": {"issuer": "Global X Canada", "url": "https://www.globalx.ca/product/chps"},
     "SOXX": {"issuer": "iShares / BlackRock", "product_id": "239705", "file_name": "SOXX_holdings"},
     "SMH": {
-        "issuer": "VanEck Offshore UCITS",
-        "url": "https://www.vaneck.com/offshore/en/investments/semiconductor-etf/holdings/",
-        "backup_urls": ["https://www.vaneck.com/lu/en/investments/semiconductor-etf/portfolio/"],
+        "issuer": "VanEck US direct XLSX",
+        "url": "https://www.vaneck.com/us/en/etf/equity/smh/holdings/download/xlsx/",
+        "backup_urls": [
+            "https://www.vaneck.com/us/en/investments/semiconductor-etf-smh/holdings/",
+            "https://www.vaneck.com/offshore/en/investments/semiconductor-etf/holdings/",
+            "https://www.vaneck.com/lu/en/investments/semiconductor-etf/portfolio/",
+        ],
     },
     "XLK": {"issuer": "State Street / SSGA", "url": "https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-xlk.xlsx"},
 }
@@ -823,30 +827,63 @@ def parse_smh_holdings_from_text(text, source_name="VanEck text"):
 
 
 def pull_vaneck_smh_page():
+    """Pull SMH holdings. Prefer the VanEck US direct XLSX endpoint because it is more stable than the page table."""
     urls = [ETF_CONFIG["SMH"]["url"]] + ETF_CONFIG["SMH"].get("backup_urls", [])
     errors = []
+
     for url in urls:
         try:
             r = requests_get(url)
-            try: return try_tables_from_html_for_candidate(r.text, "SMH", standardize_smh_candidate)
-            except Exception as e: errors.append(f"requests table {url}: {repr(e)}")
+            content_type = r.headers.get("content-type", "").lower()
+            path = urlparse(url).path.lower()
+            looks_like_download = (
+                "spreadsheet" in content_type
+                or "excel" in content_type
+                or "application/octet-stream" in content_type
+                or path.endswith((".xlsx", ".xls", ".csv"))
+                or "/download/" in path
+            )
+
+            if looks_like_download and len(r.content) > 200:
+                try:
+                    return parse_smh_from_download_bytes(r.content, f"VanEck direct download: {url}")
+                except Exception as e:
+                    errors.append(f"direct download {url}: {repr(e)}")
+
+            try:
+                return try_tables_from_html_for_candidate(r.text, "SMH", standardize_smh_candidate)
+            except Exception as e:
+                errors.append(f"requests table {url}: {repr(e)}")
+
             soup = BeautifulSoup(r.text, "html.parser")
             for a in soup.find_all("a", href=True):
-                combo = f"{a.get('href','')} {a.get_text(' ', strip=True)}".lower()
+                combo = f"{a.get('href', '')} {a.get_text(' ', strip=True)}".lower()
                 if any(x in combo for x in ["holdings", "download", "csv", "xlsx"]):
                     try:
                         rr = requests_get(urljoin(url, a.get("href", "")))
-                        if len(rr.content) > 200: return parse_smh_from_download_bytes(rr.content, "VanEck linked download")
-                    except Exception as e: errors.append(f"linked download: {repr(e)}")
-            art = fetch_rendered_artifacts(url, click_texts=["Holdings", "View all", "View All", "Portfolio"], download_texts=["Download CSV", "Download XLSX", "Export", "Export data", "Download"], wait_seconds=6)
-            if art.get("download_bytes"): return parse_smh_from_download_bytes(art["download_bytes"], "VanEck rendered download")
-            try: return try_tables_from_html_for_candidate(art.get("html", ""), "SMH", standardize_smh_candidate)
-            except Exception as e: errors.append(f"rendered table: {repr(e)}")
+                        if len(rr.content) > 200:
+                            return parse_smh_from_download_bytes(rr.content, "VanEck linked download")
+                    except Exception as e:
+                        errors.append(f"linked download: {repr(e)}")
+
+            art = fetch_rendered_artifacts(
+                url,
+                click_texts=["Holdings", "View all", "View All", "Portfolio"],
+                download_texts=["Download CSV", "Download XLSX", "Export", "Export data", "Download"],
+                wait_seconds=6,
+            )
+            if art.get("download_bytes"):
+                return parse_smh_from_download_bytes(art["download_bytes"], "VanEck rendered download")
+            try:
+                return try_tables_from_html_for_candidate(art.get("html", ""), "SMH", standardize_smh_candidate)
+            except Exception as e:
+                errors.append(f"rendered table: {repr(e)}")
             return parse_smh_holdings_from_text(art.get("text", ""), "VanEck rendered text")
+
         except Exception as e:
             errors.append(f"{url}: {repr(e)}")
-    raise ValueError("SMH VanEck holdings could not be parsed. Attempts:\n - " + "\n - ".join(errors))
 
+    raise ValueError("SMH VanEck holdings could not be parsed. Attempts:\n - " + "\n - ".join(errors))
 
 def pull_evolve_tech_csv():
     last_error = None
@@ -933,239 +970,482 @@ def pull_issuer_holdings(etf):
     return holdings
 
 # ============================================================
+
 # YAHOO DATA
 # ============================================================
+
+NUMERIC_YAHOO_COLUMNS = [
+    "Current Price", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count",
+    "Trailing PE", "Forward PE", "YTD Return",
+    "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg",
+    "Growth Last Year", "Growth This Year Est", "Growth Next Year Est",
+]
+
 
 def get_ytd_return_from_yahoo(symbol):
     try:
         today = pd.Timestamp.now(tz="America/Toronto")
-        hist = yf.Ticker(symbol).history(start=f"{today.year}-01-01", end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), auto_adjust=True)
-        if hist is None or hist.empty or "Close" not in hist.columns: return None
-        closes = hist["Close"].dropna()
-        if len(closes) < 2: return None
-        return float(closes.iloc[-1] / closes.iloc[0] - 1)
-    except Exception: return None
+        hist = yf.Ticker(symbol).history(
+            start=f"{today.year}-01-01",
+            end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            actions=False,
+        )
+        close = _clean_close_series(hist)
+        if len(close) < 2:
+            return None
+        first_close = safe_float_value(close.iloc[0])
+        last_close = safe_float_value(close.iloc[-1])
+        if first_close in [None, 0] or last_close is None:
+            return None
+        return float(last_close / first_close - 1)
+    except Exception:
+        return None
+
+
+def _yahoo_ticker_variants(symbol):
+    s = str(symbol).strip()
+    variants = [s]
+
+    # Yahoo usually uses BRK-B / BF-B, while some issuer files show BRK.B / BF.B.
+    # Do not rewrite exchange suffixes like .TO, .HK, .T, .KS.
+    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s.upper()):
+        variants.append(s.replace(".", "-"))
+
+    return list(dict.fromkeys(variants))
+
+
+def _clean_close_series(hist):
+    """Return a clean adjusted close series from yfinance output."""
+    try:
+        if hist is None or hist.empty:
+            return pd.Series(dtype=float)
+
+        if isinstance(hist.columns, pd.MultiIndex):
+            adj_cols = [c for c in hist.columns if str(c[0]).lower() == "adj close"]
+            close_cols = [c for c in hist.columns if str(c[0]).lower() == "close"]
+            chosen = adj_cols[0] if adj_cols else (close_cols[0] if close_cols else None)
+            if chosen is None:
+                return pd.Series(dtype=float)
+            close = hist[chosen]
+        else:
+            if "Adj Close" in hist.columns:
+                close = hist["Adj Close"]
+            elif "Close" in hist.columns:
+                close = hist["Close"]
+            else:
+                return pd.Series(dtype=float)
+
+        close = pd.to_numeric(close, errors="coerce").dropna()
+        if close.empty:
+            return pd.Series(dtype=float)
+
+        idx = pd.to_datetime(close.index, errors="coerce")
+        try:
+            idx = idx.tz_localize(None)
+        except Exception:
+            try:
+                idx = idx.tz_convert(None)
+            except Exception:
+                pass
+
+        close.index = idx
+        close = close[~close.index.isna()].sort_index()
+        return close
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _download_adjusted_close(symbol, start, end):
+    """Try several yfinance paths and return split/dividend-adjusted close prices."""
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+
+    for sym in _yahoo_ticker_variants(symbol):
+        for method in ["ticker_history", "download"]:
+            try:
+                if method == "ticker_history":
+                    hist = yf.Ticker(sym).history(
+                        start=start_ts.strftime("%Y-%m-%d"),
+                        end=end_ts.strftime("%Y-%m-%d"),
+                        auto_adjust=True,
+                        actions=False,
+                    )
+                else:
+                    hist = yf.download(
+                        sym,
+                        start=start_ts.strftime("%Y-%m-%d"),
+                        end=end_ts.strftime("%Y-%m-%d"),
+                        auto_adjust=True,
+                        progress=False,
+                        threads=False,
+                    )
+                close = _clean_close_series(hist)
+                if len(close) >= 2:
+                    return close
+            except Exception:
+                pass
+
+        # Period fallback, then filter ourselves.
+        for period in ["3y", "5y", "2y"]:
+            for method in ["ticker_history", "download"]:
+                try:
+                    if method == "ticker_history":
+                        hist = yf.Ticker(sym).history(period=period, auto_adjust=True, actions=False)
+                    else:
+                        hist = yf.download(sym, period=period, auto_adjust=True, progress=False, threads=False)
+                    close = _clean_close_series(hist)
+                    close = close[(close.index >= start_ts) & (close.index < end_ts)]
+                    if len(close) >= 2:
+                        return close
+                except Exception:
+                    pass
+
+    return pd.Series(dtype=float)
 
 
 def get_last_calendar_year_stock_return_from_yahoo(symbol):
     """
-    Last calendar year stock growth/return.
-
-    Uses yfinance with auto_adjust=True, so prices are adjusted for splits,
-    reverse splits, and dividends. This avoids false jumps from stock splits
-    or share consolidations.
+    Growth Last Year = previous full calendar-year adjusted stock return.
+    Example: if run in 2026, this calculates 2025 return.
+    Falls back to trailing 1-year adjusted return if needed.
     """
     try:
-        today = pd.Timestamp.now(tz="America/Toronto")
-        last_year = today.year - 1
-        start = f"{last_year}-01-01"
-        end = f"{today.year}-01-01"
-        hist = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True)
-        if hist is None or hist.empty or "Close" not in hist.columns: return None
-        closes = hist["Close"].dropna()
-        if len(closes) < 2: return None
-        first_close = closes.iloc[0]
-        last_close = closes.iloc[-1]
-        if first_close is None or pd.isna(first_close) or first_close == 0: return None
-        return float(last_close / first_close - 1)
-    except Exception: return None
+        today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+    except Exception:
+        today = pd.Timestamp.today()
+
+    last_year = today.year - 1
+    start = pd.Timestamp(year=last_year, month=1, day=1)
+    end = pd.Timestamp(year=today.year, month=1, day=1)
+
+    try:
+        close = _download_adjusted_close(symbol, start, end)
+        if len(close) >= 2:
+            first_price = safe_float_value(close.iloc[0])
+            last_price = safe_float_value(close.iloc[-1])
+            if first_price not in [None, 0] and last_price is not None:
+                return float(last_price / first_price - 1)
+    except Exception:
+        pass
+
+    try:
+        end2 = today + pd.Timedelta(days=1)
+        start2 = today - pd.DateOffset(years=1)
+        close = _download_adjusted_close(symbol, start2, end2)
+        if len(close) >= 2:
+            first_price = safe_float_value(close.iloc[0])
+            last_price = safe_float_value(close.iloc[-1])
+            if first_price not in [None, 0] and last_price is not None:
+                return float(last_price / first_price - 1)
+    except Exception:
+        pass
+
+    return None
 
 
 def get_yf_dataframe(ticker_obj, names):
     for name in names:
         try:
             obj = getattr(ticker_obj, name, None)
-            if obj is None: continue
+            if obj is None:
+                continue
             df = obj() if callable(obj) else obj
-            if isinstance(df, pd.DataFrame) and not df.empty: return df.copy()
-        except Exception: pass
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df.copy()
+        except Exception:
+            pass
     return pd.DataFrame()
 
 
-def norm_label(x): return re.sub(r"[^a-z0-9+\-]", "", str(x).lower())
+def norm_label(x):
+    return re.sub(r"[^a-z0-9+\-]", "", str(x).lower())
 
 
 def find_estimate_row(df, row_patterns):
-    if df is None or df.empty: return None
+    if df is None or df.empty:
+        return None
     pats = [norm_label(x) for x in row_patterns]
     for idx in df.index:
         ni = norm_label(idx)
         for pat in pats:
-            if ni == pat or pat in ni: return df.loc[idx]
+            if ni == pat or pat in ni:
+                return df.loc[idx]
     return None
 
 
 def row_average_value(row):
-    if row is None: return None
+    if row is None:
+        return None
     if isinstance(row, pd.DataFrame):
-        if row.empty: return None
+        if row.empty:
+            return None
         row = row.iloc[0]
+
     preferred = ["avg", "average", "avgestimate", "avg estimate", "avg.", "mean"]
     for col in row.index:
         nc = norm_label(col)
         if any(norm_label(p) in nc for p in preferred):
             v = safe_float_value(row[col])
-            if v is not None: return v
+            if v is not None:
+                return v
+
     for col in row.index:
         v = safe_float_value(row[col])
-        if v is not None: return v
+        if v is not None:
+            return v
     return None
 
 
 def get_annual_eps_from_financials(ticker_obj):
     candidates = []
     for attr in ["income_stmt", "financials"]:
-        try: candidates.append(getattr(ticker_obj, attr))
-        except Exception: pass
+        try:
+            candidates.append(getattr(ticker_obj, attr))
+        except Exception:
+            pass
+
     for func in ["get_income_stmt", "get_financials"]:
         try:
             f = getattr(ticker_obj, func)
-            try: candidates.append(f(freq="yearly"))
-            except TypeError: candidates.append(f())
-        except Exception: pass
+            try:
+                candidates.append(f(freq="yearly"))
+            except TypeError:
+                candidates.append(f())
+        except Exception:
+            pass
+
     for df in candidates:
         try:
-            if df is None or not isinstance(df, pd.DataFrame) or df.empty: continue
-            row_key = None; norm_index = {norm_label(i): i for i in df.index}
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            row_key = None
+            norm_index = {norm_label(i): i for i in df.index}
             for rn in ["Diluted EPS", "Basic EPS", "Normalized Diluted EPS", "DilutedEPS", "BasicEPS"]:
                 nrn = norm_label(rn)
                 for ni, original_idx in norm_index.items():
-                    if nrn == ni or nrn in ni: row_key = original_idx; break
-                if row_key is not None: break
-            if row_key is None: continue
+                    if nrn == ni or nrn in ni:
+                        row_key = original_idx
+                        break
+                if row_key is not None:
+                    break
+
+            if row_key is None:
+                continue
+
             row = pd.to_numeric(df.loc[row_key], errors="coerce").dropna()
-            if row.empty: continue
+            if row.empty:
+                continue
+
             try:
                 dates = pd.to_datetime(row.index, errors="coerce")
-                if dates.notna().sum() >= 2: row = row.iloc[np.argsort(dates.values)[::-1]]
-            except Exception: pass
+                if dates.notna().sum() >= 2:
+                    row = row.iloc[np.argsort(dates.values)[::-1]]
+            except Exception:
+                pass
+
             return safe_float_value(row.iloc[0])
-        except Exception: pass
+        except Exception:
+            pass
+
     return None
 
 
 def get_eps_estimates_from_yfinance(ticker_obj):
     df = get_yf_dataframe(ticker_obj, ["get_earnings_estimate", "earnings_estimate"])
-    eps_this_year = eps_next_year = None
+    eps_this_year = None
+    eps_next_year = None
+
     if not df.empty:
         eps_this_year = row_average_value(find_estimate_row(df, ["0y", "current year", "currentyear", "current fiscal year"]))
         eps_next_year = row_average_value(find_estimate_row(df, ["+1y", "next year", "nextyear", "next fiscal year"]))
-    try: info = ticker_obj.get_info()
+
+    try:
+        info = ticker_obj.get_info()
     except Exception:
-        try: info = ticker_obj.info
-        except Exception: info = {}
+        try:
+            info = ticker_obj.info
+        except Exception:
+            info = {}
+
     if isinstance(info, dict):
         if eps_this_year is None:
             for k in ["epsCurrentYear", "currentYearEps", "earningsEstimateCurrentYear"]:
                 eps_this_year = safe_float_value(info.get(k))
-                if eps_this_year is not None: break
+                if eps_this_year is not None:
+                    break
         if eps_next_year is None:
             for k in ["epsNextYear", "nextYearEps", "earningsEstimateNextYear"]:
                 eps_next_year = safe_float_value(info.get(k))
-                if eps_next_year is not None: break
+                if eps_next_year is not None:
+                    break
+
     return eps_this_year, eps_next_year
 
 
 def get_growth_estimates_from_yfinance(ticker_obj):
-    """
-    Yahoo Finance Analysis -> Growth Estimates.
-
-    Used for Growth This Year Est and Growth Next Year Est.
-    Growth Last Year is calculated separately from last calendar year's
-    split-adjusted stock return, because Yahoo usually does not provide a true
-    last-year row in Growth Estimates.
-    """
+    """Yahoo Finance Analysis -> Growth Estimates. Only this/next year are used."""
     df = get_yf_dataframe(ticker_obj, ["get_growth_estimates", "growth_estimates"])
-    if df.empty: return None, None, None
-    def pick_row(patterns): return find_estimate_row(df, patterns)
+    if df.empty:
+        return None, None, None
+
+    def pick_row(patterns):
+        return find_estimate_row(df, patterns)
+
     def pick_value(row):
-        if row is None: return None
+        if row is None:
+            return None
         if isinstance(row, pd.DataFrame):
-            if row.empty: return None
+            if row.empty:
+                return None
             row = row.iloc[0]
         for col in row.index:
             if any(norm_label(p) in norm_label(col) for p in ["stock trend", "stocktrend", "stock", "estimate", "growth"]):
                 v = normalize_growth_rate(row[col])
-                if v is not None: return v
+                if v is not None:
+                    return v
         for col in row.index:
             v = normalize_growth_rate(row[col])
-            if v is not None: return v
+            if v is not None:
+                return v
         return None
+
     last_row = pick_row(["-1y", "last year", "lastyear", "past year", "pastyear"])
     if last_row is None:
         last_row = pick_row(["-5y", "past 5 years", "past5years", "past 5 years per annum"])
     this_row = pick_row(["0y", "current year", "currentyear", "current fiscal year"])
     next_row = pick_row(["+1y", "next year", "nextyear", "next fiscal year"])
+
     return pick_value(last_row), pick_value(this_row), pick_value(next_row)
 
 
 def get_eps_and_growth_data(ticker_obj):
     eps_last_year = get_annual_eps_from_financials(ticker_obj)
     eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
-    _unused_growth_last_year, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
+    _ignore_last, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
+
     return {
         "EPS Last Year": eps_last_year,
         "EPS This Year Est Avg": eps_this_year,
         "EPS Next Year Est Avg": eps_next_year,
-        "Growth Last Year": None,
         "Growth This Year Est": growth_this_year,
         "Growth Next Year Est": growth_next_year,
     }
 
 
 def pull_yahoo_targets(symbol):
-    out = {"Yahoo Ticker": symbol, "Current Price": None, "Target Low": None, "Target Mean": None, "Target High": None, "Target Median": None, "Analyst Count": None, "Trailing PE": None, "Forward PE": None, "YTD Return": None, "EPS Last Year": None, "EPS This Year Est Avg": None, "EPS Next Year Est Avg": None, "Growth Last Year": None, "Growth This Year Est": None, "Growth Next Year Est": None, "Yahoo Error": None}
+    out = {
+        "Yahoo Ticker": symbol,
+        "Current Price": None,
+        "Target Low": None,
+        "Target Mean": None,
+        "Target High": None,
+        "Target Median": None,
+        "Analyst Count": None,
+        "Trailing PE": None,
+        "Forward PE": None,
+        "YTD Return": None,
+        "EPS Last Year": None,
+        "EPS This Year Est Avg": None,
+        "EPS Next Year Est Avg": None,
+        "Growth Last Year": None,
+        "Growth This Year Est": None,
+        "Growth Next Year Est": None,
+        "Yahoo Error": None,
+    }
+
     try:
         t = yf.Ticker(symbol)
+
         try:
             targets = t.get_analyst_price_targets()
             if isinstance(targets, dict):
-                out.update({"Target Low": targets.get("low"), "Target Mean": targets.get("mean"), "Target High": targets.get("high"), "Target Median": targets.get("median"), "Analyst Count": targets.get("numberOfAnalysts")})
+                out["Target Low"] = targets.get("low")
+                out["Target Mean"] = targets.get("mean")
+                out["Target High"] = targets.get("high")
+                out["Target Median"] = targets.get("median")
+                out["Analyst Count"] = targets.get("numberOfAnalysts")
             elif isinstance(targets, pd.DataFrame) and not targets.empty:
                 row = targets.iloc[0]
-                out.update({"Target Low": row.get("low"), "Target Mean": row.get("mean"), "Target High": row.get("high"), "Target Median": row.get("median"), "Analyst Count": row.get("numberOfAnalysts")})
-        except Exception as e: out["Yahoo Error"] = f"target error: {e}"
+                out["Target Low"] = row.get("low")
+                out["Target Mean"] = row.get("mean")
+                out["Target High"] = row.get("high")
+                out["Target Median"] = row.get("median")
+                out["Analyst Count"] = row.get("numberOfAnalysts")
+        except Exception as e:
+            out["Yahoo Error"] = f"target error: {e}"
+
         try:
             fast = t.fast_info
             out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        except Exception: pass
+        except Exception:
+            pass
+
         if out["Current Price"] is None or pd.isna(out["Current Price"]):
             try:
                 hist = t.history(period="5d", auto_adjust=False)
-                if hist is not None and not hist.empty: out["Current Price"] = hist["Close"].dropna().iloc[-1]
-            except Exception: pass
-        try: info = t.get_info()
+                if hist is not None and not hist.empty:
+                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
+            except Exception:
+                pass
+
+        try:
+            info = t.get_info()
         except Exception:
-            try: info = t.info
-            except Exception: info = {}
+            try:
+                info = t.info
+            except Exception:
+                info = {}
+
         if isinstance(info, dict):
             out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
             out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
+
         out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
-        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
+
         try:
             out.update(get_eps_and_growth_data(t))
-            # Override with calculated last-calendar-year stock return.
-            # Yahoo Growth Estimates usually has Past 5 Years, not true last year.
-            out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
-        except Exception as e: out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
-    except Exception as e: out["Yahoo Error"] = str(e)
+        except Exception as e:
+            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
+
+        # Hard assignment after all other updates so it cannot be overwritten by Yahoo Growth Estimates.
+        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
+        if out["Growth Last Year"] is None:
+            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + "Growth Last Year unavailable from adjusted price history"
+
+    except Exception as e:
+        out["Yahoo Error"] = str(e)
+
     return out
 
 
 def add_yahoo_targets(holdings):
     rows = []
     symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
+
     for i, symbol in enumerate(symbols, 1):
         print(f"Yahoo targets + PE + YTD + EPS + Growth {i}/{len(symbols)}: {symbol}")
         rows.append(pull_yahoo_targets(symbol))
         time.sleep(YAHOO_SLEEP_SECONDS)
-    merged = holdings.merge(pd.DataFrame(rows), on="Yahoo Ticker", how="left")
-    for c in ["Current Price", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count", "Trailing PE", "Forward PE", "YTD Return", "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg", "Growth Last Year", "Growth This Year Est", "Growth Next Year Est"]:
-        if c in merged.columns: merged[c] = pd.to_numeric(merged[c], errors="coerce")
+
+    targets = pd.DataFrame(rows)
+    merged = holdings.merge(targets, on="Yahoo Ticker", how="left")
+
+    for c in NUMERIC_YAHOO_COLUMNS:
+        if c in merged.columns:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+
+    if "Growth Last Year" in merged.columns:
+        missing = merged["Growth Last Year"].isna()
+        if missing.any():
+            for sym in merged.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
+                val = get_last_calendar_year_stock_return_from_yahoo(sym)
+                if val is not None:
+                    merged.loc[merged["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
+
     return merged
 
-# ============================================================
 # CALCULATIONS
 # ============================================================
 
@@ -1297,1017 +1577,29 @@ def build_fear_greed_summary():
     return pd.DataFrame(), last_error or "No usable CNN Fear & Greed data returned."
 
 # ============================================================
-# EXCEL EXPORT
-# ============================================================
-
-def build_excel_summary_rows(summary_df):
-    rows = []
-    for _, r in summary_df.iterrows():
-        etf, cur, worst = r["ETF"], get_etf_current_price(r["ETF"]), r.get("Raw Worst Case Return")
-        rows.append({"ETF": etf, "reliable": r.get("Covered Weight"), "YTD": r.get("ETF YTD Return"), "Average": r.get("Raw Mean Case Return"), "Median": r.get("Raw Median Case Return"), "WORST": worst, "BEST": r.get("Raw Best Case Return"), "Current pr": cur, "worst price": cur * (1 + worst) if cur is not None and pd.notna(worst) else None, "PE Ratio": r.get("PE Ratio"), "PE coverage": r.get("PE Coverage Weight"), "Forward PE": r.get("Forward PE"), "Forward PE coverage": r.get("Forward PE Coverage Weight")})
-    return pd.DataFrame(rows)
-
-
-def prepare_detail_sheet(details):
-    df = details.copy(); out = pd.DataFrame()
-    out["Ticker"] = df["Yahoo Ticker"]; out["% of Portfolio"] = df["Weight Decimal"]; out["YTD"] = df["YTD Return"]
-    out["Worst"] = df["Low Return"]; out["Average"] = df["Mean Return"]; out["Median"] = df["Median Return"]; out["Best"] = df["High Return"]
-    out["Worst Target"] = df["Target Low"]; out["Average Target"] = df["Target Mean"]; out["Median Target"] = df["Target Median"]; out["Best Target"] = df["Target High"]; out["Current"] = df["Current Price"]
-    out["Current PE"] = df["Trailing PE"]; out["Forward PE"] = df["Forward PE"]
-    out["EPS Last Year"] = df["EPS Last Year"]; out["EPS This Year Est Avg"] = df["EPS This Year Est Avg"]; out["EPS Next Year Est Avg"] = df["EPS Next Year Est Avg"]
-    out["Growth Last Year"] = df["Growth Last Year"]; out["Growth This Year Est"] = df["Growth This Year Est"]; out["Growth Next Year Est"] = df["Growth Next Year Est"]
-    return out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
-
-
-def export_excel_report(all_details, summaries, output_path=None, report_date=None):
-    output_path = Path(output_path) if output_path else OUTPUT_DIR / "ETF_analyst_report.xlsx"
-    today = pd.Timestamp.now(tz="America/Toronto")
-    report_date = report_date or f"{today.month}/{today.day}/{today.year}"
-    summary_rows = build_excel_summary_rows(pd.DataFrame(summaries))
-    fg, fg_err = build_fear_greed_summary(); vix, vix_err = build_vix_summary()
-    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        wb = writer.book
-        title = wb.add_format({"bold": True, "font_size": 12, "align": "center", "valign": "vcenter", "border": 1})
-        section = wb.add_format({"bold": True, "font_size": 12, "align": "left", "valign": "vcenter"})
-        header = wb.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#E2F0D9"})
-        header_white = wb.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#FFFFFF"})
-        normal = wb.add_format({"border": 1, "align": "center", "valign": "vcenter"})
-        text_fmt = wb.add_format({"border": 1, "align": "left", "valign": "vcenter"})
-        pct = wb.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
-        pct_red = wb.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%", "font_color": "#FF0000"})
-        pct_green = wb.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%", "bg_color": "#C6E0B4"})
-        money = wb.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0.00"})
-        money_red = wb.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0.00", "font_color": "#FF0000"})
-        num = wb.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00"})
-        integer = wb.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0"})
-        total_pct = wb.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
-        ws = wb.add_worksheet("Summary"); writer.sheets["Summary"] = ws
-        headers = ["", "reliable", "YTD", "Average", "Median", "WORST", "BEST", "Current pr", "worst price", "PE Ratio", "PE coverage", "Forward PE", "Forward PE coverage"]
-        sr, sc = 3, 1
-        ws.write(sr, sc, report_date, header)
-        for j, h in enumerate(headers[1:], sc + 1): ws.write(sr, j, h, header_white)
-        for i, row in summary_rows.iterrows():
-            r = sr + 1 + i; ws.write(r, sc, row["ETF"], text_fmt)
-            for off, col in [(1,"reliable"),(2,"YTD"),(3,"Average"),(4,"Median"),(5,"WORST"),(6,"BEST")]: ws.write_number(r, sc+off, row[col] if pd.notna(row[col]) else 0, pct)
-            for off, col, fmt in [(7,"Current pr",money),(8,"worst price",money_red)]: ws.write_number(r, sc+off, row[col], fmt) if pd.notna(row[col]) else ws.write(r, sc+off, "-", normal)
-            for off, col, fmt in [(9,"PE Ratio",num),(10,"PE coverage",pct),(11,"Forward PE",num),(12,"Forward PE coverage",pct)]: ws.write_number(r, sc+off, row[col], fmt) if pd.notna(row[col]) else ws.write(r, sc+off, "-", normal)
-        end_row = sr + len(summary_rows)
-        ws.conditional_format(f"D5:H{end_row+1}", {"type":"cell", "criteria":"<", "value":0, "format":pct_red})
-        ws.conditional_format(f"D5:H{end_row+1}", {"type":"cell", "criteria":">=", "value":0.3, "format":pct_green})
-        fg_start = end_row + 4; ws.write(fg_start, sc, "Fear & Greed Index", section)
-        if fg_err:
-            ws.write(fg_start+1, sc, f"Fear & Greed data unavailable: {fg_err}", text_fmt); vix_start = fg_start + 4
-        else:
-            for j,h in enumerate(fg.columns, sc): ws.write(fg_start+1, j, h, header_white)
-            for i,row in fg.iterrows():
-                rr = fg_start + 2 + i
-                for j,h in enumerate(fg.columns, sc): ws.write_number(rr,j,float(row[h]),num) if h=="Score" else ws.write(rr,j,str(row[h]), text_fmt if h in ["Metric","Rating","Source"] else normal)
-            vix_start = fg_start + 5
-        ws.write(vix_start, sc, "VIX percentile analysis", section)
-        if vix_err: ws.write(vix_start+1, sc, f"VIX data unavailable: {vix_err}", text_fmt)
-        else:
-            for j,h in enumerate(vix.columns, sc): ws.write(vix_start+1, j, h, header_white)
-            for i,row in vix.iterrows():
-                rr = vix_start+2+i
-                for j,h in enumerate(vix.columns, sc):
-                    val = row[h]
-                    if h == "Period": ws.write(rr,j,val,text_fmt)
-                    elif h in ["Start Date", "End Date"]: ws.write(rr,j,str(val),normal)
-                    elif h == "Trading Days": ws.write_number(rr,j,int(val),integer)
-                    elif h == "Percentile Rank": ws.write_number(rr,j,val/100.0,pct)
-                    else: ws.write_number(rr,j,float(val),num)
-        ws.set_column("B:B",14); ws.set_column("C:H",12); ws.set_column("I:N",14); ws.set_column("O:P",15); ws.freeze_panes(sr+1, 0)
-        for details in all_details:
-            if details.empty: continue
-            etf_vals = details["ETF"].dropna().astype(str).unique(); etf = etf_vals[0] if len(etf_vals) else f"ETF_{len(writer.sheets)}"
-            safe = etf.replace(".", "_").replace("/", "_").replace("\\", "_").replace("?", "_").replace("*", "_").replace("[", "_").replace("]", "_").replace(":", "_")[:31]
-            base, counter, used = safe, 1, {n.lower() for n in writer.sheets.keys()}
-            while safe.lower() in used:
-                suffix = f"_{counter}"; safe = base[:31-len(suffix)] + suffix; counter += 1
-            detail = prepare_detail_sheet(details); ws = wb.add_worksheet(safe); writer.sheets[safe] = ws
-            ws.write(0,0,report_date,header_white); ws.write(0,1,"Weight",header_white); ws.write(0,2,"YTD",header_white); ws.merge_range(0,3,0,6,"Analyst Target Return",title); ws.merge_range(0,8,0,20,"Yahoo Finance",title)
-            main_headers = [etf, "% of Portfolio", "YTD", "Worst", "Average", "Median", "Best", "", "Worst Target", "Average Target", "Median Target", "Best Target", "Current", "Current PE", "Forward PE", "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg", "Growth Last Year", "Growth This Year Est", "Growth Next Year Est"]
-            for c,h in enumerate(main_headers): ws.write(1,c,h,header_white)
-            ds = 2
-            for i,row in detail.iterrows():
-                r = ds + i; ws.write(r,0,row["Ticker"],text_fmt); ws.write_number(r,1,row["% of Portfolio"] if pd.notna(row["% of Portfolio"]) else 0,pct)
-                for c,col,fmt in [(2,"YTD",pct),(3,"Worst",pct),(4,"Average",pct),(5,"Median",pct),(6,"Best",pct),(8,"Worst Target",money),(9,"Average Target",money),(10,"Median Target",money),(11,"Best Target",money),(12,"Current",money_red),(13,"Current PE",num),(14,"Forward PE",num),(15,"EPS Last Year",num),(16,"EPS This Year Est Avg",num),(17,"EPS Next Year Est Avg",num),(18,"Growth Last Year",pct),(19,"Growth This Year Est",pct),(20,"Growth Next Year Est",pct)]:
-                    ws.write_number(r,c,row[col],fmt) if pd.notna(row[col]) else ws.write(r,c,"-",normal)
-                ws.write(r,7,"",normal)
-            total_row = ds + len(detail) + 1; first = ds + 1; last = ds + len(detail)
-            ws.write(total_row,0,"TOTAL",header_white)
-            for c, col_letter in [(1,"B"),(2,"C"),(3,"D"),(4,"E"),(5,"F"),(6,"G")]:
-                formula = f"=SUM({col_letter}{first}:{col_letter}{last})" if c == 1 else f"=SUMPRODUCT(B{first}:B{last},{col_letter}{first}:{col_letter}{last})"
-                ws.write_formula(total_row,c,formula,total_pct)
-            ws.conditional_format(f"C3:G{last}", {"type":"cell","criteria":"<","value":0,"format":pct_red}); ws.conditional_format(f"C3:G{last}", {"type":"cell","criteria":">=","value":0.3,"format":pct_green})
-            ws.conditional_format(f"S3:U{last}", {"type":"cell","criteria":"<","value":0,"format":pct_red}); ws.conditional_format(f"S3:U{last}", {"type":"cell","criteria":">=","value":0.3,"format":pct_green})
-            ws.freeze_panes(2,1); ws.set_column("A:A",11); ws.set_column("B:B",14); ws.set_column("C:G",11); ws.set_column("H:H",3); ws.set_column("I:M",13); ws.set_column("N:O",12); ws.set_column("P:R",18); ws.set_column("S:U",18)
-    print(f"Saved Excel report: {output_path}")
-    return output_path
 
 # ============================================================
-# RUNNERS
+# EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-def run_one_etf(etf):
-    if etf.upper() == "TECH": etf = "TECH.TO"
-    if etf.upper() == "CHPS": etf = "CHPS.TO"
-    holdings = pull_issuer_holdings(etf)
-    enriched = calculate_returns(add_yahoo_targets(holdings))
-    summary = summarize_etf(enriched, etf); print_summary(summary)
-    output_cols = ["ETF", "Yahoo Ticker", "Raw Ticker", "Name", "Weight", "Weight Decimal", "Current Price", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count", "Trailing PE", "Forward PE", "YTD Return", "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg", "Growth Last Year", "Growth This Year Est", "Growth Next Year Est", "Low Return", "Mean Return", "High Return", "Median Return", "Weighted Low Return", "Weighted Mean Return", "Weighted High Return", "Weighted Median Return", "Shares Held", "Identifier", "Source Note", "Yahoo Error"]
-    enriched = enriched[[c for c in output_cols if c in enriched.columns]].sort_values("Weight", ascending=False).reset_index(drop=True)
-    return enriched, summary
-
-
-def main_with_excel():
-    all_details, summaries, failures = [], [], []
-    for etf in ETFS:
-        try:
-            details, summary = run_one_etf(etf); all_details.append(details); summaries.append(summary)
-        except Exception as e:
-            print("\n" + "!"*72); print(f"FAILED: {etf}"); print(repr(e)); print("!"*72); failures.append({"ETF": etf, "Error": repr(e)})
-    if summaries and all_details: export_excel_report(all_details, summaries)
-    if failures:
-        print("\nFailures:")
-        for f in failures: print(f"{f['ETF']}: {f['Error']}")
-    return all_details, summaries, failures
-
-
-def main(): return main_with_excel()
-
-
-# ============================================================
-# FINAL HOTFIX: Growth Last Year = last calendar year stock return
-# This block intentionally overrides previous functions.
-# ============================================================
-
-def _history_close_series_for_return(symbol, start_date, end_date):
-    """
-    Robust adjusted close history getter.
-    Tries Ticker.history, period fallback, and yf.download.
-    Uses adjusted prices so splits/reverse splits do not create fake returns.
-    """
-    symbols_to_try = [str(symbol).strip()]
-    s0 = symbols_to_try[0]
-
-    # Yahoo normally uses BRK-B, BF-B, etc. for US share classes.
-    # Do not change exchange suffixes such as .TO, .HK, .T, .KS.
-    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s0):
-        symbols_to_try.append(s0.replace(".", "-"))
-
-    for sym in dict.fromkeys(symbols_to_try):
-        try:
-            hist = yf.Ticker(sym).history(
-                start=str(start_date.date() if hasattr(start_date, "date") else start_date),
-                end=str(end_date.date() if hasattr(end_date, "date") else end_date),
-                auto_adjust=True,
-                actions=False,
-            )
-            if hist is not None and not hist.empty and "Close" in hist.columns:
-                close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
-                if len(close) >= 2:
-                    return close
-        except Exception:
-            pass
-
-        try:
-            hist = yf.Ticker(sym).history(period="3y", auto_adjust=True, actions=False)
-            if hist is not None and not hist.empty and "Close" in hist.columns:
-                tmp = hist.copy()
-                idx = pd.to_datetime(tmp.index, errors="coerce")
-                try:
-                    idx = idx.tz_localize(None)
-                except Exception:
-                    try:
-                        idx = idx.tz_convert(None)
-                    except Exception:
-                        pass
-                tmp.index = idx
-                tmp = tmp[(tmp.index >= pd.Timestamp(start_date)) & (tmp.index < pd.Timestamp(end_date))]
-                close = pd.to_numeric(tmp["Close"], errors="coerce").dropna()
-                if len(close) >= 2:
-                    return close
-        except Exception:
-            pass
-
-        try:
-            hist = yf.download(
-                sym,
-                start=str(start_date.date() if hasattr(start_date, "date") else start_date),
-                end=str(end_date.date() if hasattr(end_date, "date") else end_date),
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
-            if hist is not None and not hist.empty:
-                if isinstance(hist.columns, pd.MultiIndex):
-                    close_cols = [c for c in hist.columns if c[0] == "Close"]
-                    close = hist[close_cols[0]] if close_cols else None
-                else:
-                    close = hist["Close"] if "Close" in hist.columns else None
-                if close is not None:
-                    close = pd.to_numeric(close, errors="coerce").dropna()
-                    if len(close) >= 2:
-                        return close
-        except Exception:
-            pass
-
-    return pd.Series(dtype=float)
-
-
-def get_last_calendar_year_stock_return_from_yahoo(symbol):
-    """
-    Last calendar year stock return/growth.
-    Example: if today is in 2026, this calculates 2025 return.
-    Uses adjusted prices, so stock splits/reverse splits are handled.
-    """
-    try:
-        today = pd.Timestamp.now(tz="America/Toronto")
-        last_year = today.year - 1
-        start = pd.Timestamp(year=last_year, month=1, day=1)
-        end = pd.Timestamp(year=today.year, month=1, day=1)
-
-        close = _history_close_series_for_return(symbol, start, end)
-        if close is None or len(close) < 2:
-            return None
-
-        first_close = safe_float_value(close.iloc[0])
-        last_close = safe_float_value(close.iloc[-1])
-        if first_close is None or first_close == 0 or last_close is None:
-            return None
-
-        return float(last_close / first_close - 1)
-    except Exception:
-        return None
-
-
-def get_eps_and_growth_data(ticker_obj):
-    """
-    EPS:
-    - EPS Last Year from annual financials
-    - EPS This Year Est Avg from Yahoo earnings estimate
-    - EPS Next Year Est Avg from Yahoo earnings estimate
-
-    Growth:
-    - Growth This Year Est and Growth Next Year Est from Yahoo Finance Analysis -> Growth Estimates
-    - Growth Last Year is calculated separately from adjusted historical price in pull_yahoo_targets().
-    """
-    eps_last_year = get_annual_eps_from_financials(ticker_obj)
-    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
-    _unused_growth_last_year, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
-    return {
-        "EPS Last Year": eps_last_year,
-        "EPS This Year Est Avg": eps_this_year,
-        "EPS Next Year Est Avg": eps_next_year,
-        "Growth This Year Est": growth_this_year,
-        "Growth Next Year Est": growth_next_year,
-    }
-
-
-def pull_yahoo_targets(symbol):
-    out = {
-        "Yahoo Ticker": symbol,
-        "Current Price": None,
-        "Target Low": None,
-        "Target Mean": None,
-        "Target High": None,
-        "Target Median": None,
-        "Analyst Count": None,
-        "Trailing PE": None,
-        "Forward PE": None,
-        "YTD Return": None,
-        "EPS Last Year": None,
-        "EPS This Year Est Avg": None,
-        "EPS Next Year Est Avg": None,
-        "Growth Last Year": None,
-        "Growth This Year Est": None,
-        "Growth Next Year Est": None,
-        "Yahoo Error": None,
-    }
-    try:
-        t = yf.Ticker(symbol)
-
-        try:
-            targets = t.get_analyst_price_targets()
-            if isinstance(targets, dict):
-                out.update({
-                    "Target Low": targets.get("low"),
-                    "Target Mean": targets.get("mean"),
-                    "Target High": targets.get("high"),
-                    "Target Median": targets.get("median"),
-                    "Analyst Count": targets.get("numberOfAnalysts"),
-                })
-            elif isinstance(targets, pd.DataFrame) and not targets.empty:
-                row = targets.iloc[0]
-                out.update({
-                    "Target Low": row.get("low"),
-                    "Target Mean": row.get("mean"),
-                    "Target High": row.get("high"),
-                    "Target Median": row.get("median"),
-                    "Analyst Count": row.get("numberOfAnalysts"),
-                })
-        except Exception as e:
-            out["Yahoo Error"] = f"target error: {e}"
-
-        try:
-            fast = t.fast_info
-            out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        except Exception:
-            pass
-
-        if out["Current Price"] is None or pd.isna(out["Current Price"]):
-            try:
-                hist = t.history(period="5d", auto_adjust=False)
-                if hist is not None and not hist.empty:
-                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
-            except Exception:
-                pass
-
-        try:
-            info = t.get_info()
-        except Exception:
-            try:
-                info = t.info
-            except Exception:
-                info = {}
-
-        if isinstance(info, dict):
-            out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
-            out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
-
-        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
-
-        # Important fix: historical adjusted stock return, not Yahoo Growth Estimates.
-        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
-
-        try:
-            out.update(get_eps_and_growth_data(t))
-        except Exception as e:
-            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
-
-        # Re-apply so it cannot be overwritten by any update() call.
-        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
-
-    except Exception as e:
-        out["Yahoo Error"] = str(e)
-    return out
-
-
-# ============================================================
-# FINAL FINAL HOTFIX: Growth Last Year = robust adjusted stock price return
-# Inserted before SCRIPT RUN so it is active when running this .py file.
-# ============================================================
-
-def _normalize_history_close_for_growth(hist):
-    """
-    Return an adjusted close Series from yfinance output.
-    With auto_adjust=True, Close is adjusted for splits/dividends.
-    If Adj Close exists, use Adj Close.
-    """
-    try:
-        if hist is None or hist.empty:
-            return pd.Series(dtype=float)
-
-        if isinstance(hist.columns, pd.MultiIndex):
-            # Prefer Adj Close if present, otherwise Close.
-            adj_cols = [c for c in hist.columns if str(c[0]).lower() == "adj close"]
-            close_cols = [c for c in hist.columns if str(c[0]).lower() == "close"]
-            chosen = adj_cols[0] if adj_cols else (close_cols[0] if close_cols else None)
-            if chosen is None:
-                return pd.Series(dtype=float)
-            close = hist[chosen]
-        else:
-            if "Adj Close" in hist.columns:
-                close = hist["Adj Close"]
-            elif "Close" in hist.columns:
-                close = hist["Close"]
-            else:
-                return pd.Series(dtype=float)
-
-        close = pd.to_numeric(close, errors="coerce").dropna()
-        if close.empty:
-            return pd.Series(dtype=float)
-
-        idx = pd.to_datetime(close.index, errors="coerce")
-        try:
-            idx = idx.tz_localize(None)
-        except Exception:
-            try:
-                idx = idx.tz_convert(None)
-            except Exception:
-                pass
-
-        close.index = idx
-        close = close[~close.index.isna()].sort_index()
-        return close
-    except Exception:
-        return pd.Series(dtype=float)
-
-
-def _ticker_variants_for_yahoo(symbol):
-    s = str(symbol).strip()
-    variants = [s]
-
-    # Yahoo usually uses BRK-B / BF-B, while holdings sometimes show BRK.B / BF.B.
-    # Do not touch exchange suffixes like .TO, .HK, .T, .KS.
-    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s.upper()):
-        variants.append(s.replace(".", "-"))
-
-    return list(dict.fromkeys(variants))
-
-
-def _get_adjusted_close_history_for_growth(symbol):
-    """
-    Robust adjusted history getter. This uses several yfinance paths.
-    It returns a close series adjusted for splits/reverse splits.
-    """
-    for sym in _ticker_variants_for_yahoo(symbol):
-        # Most reliable: period download, then filter ourselves.
-        for period in ["3y", "5y", "2y"]:
-            try:
-                hist = yf.Ticker(sym).history(period=period, auto_adjust=True, actions=False)
-                close = _normalize_history_close_for_growth(hist)
-                if len(close) >= 2:
-                    return close
-            except Exception:
-                pass
-
-            try:
-                hist = yf.download(sym, period=period, auto_adjust=True, progress=False, threads=False)
-                close = _normalize_history_close_for_growth(hist)
-                if len(close) >= 2:
-                    return close
-            except Exception:
-                pass
-
-        # Date-range fallback.
-        try:
-            today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
-        except Exception:
-            today = pd.Timestamp.today()
-
-        start = today - pd.DateOffset(years=3)
-        end = today + pd.Timedelta(days=1)
-        try:
-            hist = yf.Ticker(sym).history(
-                start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                auto_adjust=True,
-                actions=False,
-            )
-            close = _normalize_history_close_for_growth(hist)
-            if len(close) >= 2:
-                return close
-        except Exception:
-            pass
-
-    return pd.Series(dtype=float)
-
-
-def _price_on_or_after(close, dt, max_days=21):
-    try:
-        dt = pd.Timestamp(dt).tz_localize(None)
-    except Exception:
-        dt = pd.Timestamp(dt)
-
-    sub = close[close.index >= dt]
-    if sub.empty:
-        return None
-
-    if (sub.index[0] - dt).days > max_days:
-        return None
-
-    return safe_float_value(sub.iloc[0])
-
-
-def _price_on_or_before(close, dt, max_days=21):
-    try:
-        dt = pd.Timestamp(dt).tz_localize(None)
-    except Exception:
-        dt = pd.Timestamp(dt)
-
-    sub = close[close.index <= dt]
-    if sub.empty:
-        return None
-
-    if (dt - sub.index[-1]).days > max_days:
-        return None
-
-    return safe_float_value(sub.iloc[-1])
-
-
-def get_last_calendar_year_stock_return_from_yahoo(symbol):
-    """
-    Growth Last Year = previous full calendar-year stock return.
-
-    Example: if run in 2026, this calculates 2025 return:
-        adjusted close near Dec 31, 2025 / adjusted close near Jan 1, 2025 - 1
-
-    Uses adjusted prices, so stock splits/reverse splits are handled.
-    If previous-calendar-year data is unavailable, it falls back to trailing 1-year return.
-    """
-    try:
-        close = _get_adjusted_close_history_for_growth(symbol)
-        if close is None or len(close) < 2:
-            return None
-
-        try:
-            today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
-        except Exception:
-            today = pd.Timestamp.today()
-
-        last_year = today.year - 1
-        start_dt = pd.Timestamp(year=last_year, month=1, day=1)
-        end_dt = pd.Timestamp(year=today.year, month=1, day=1) - pd.Timedelta(days=1)
-
-        start_price = _price_on_or_after(close, start_dt, max_days=21)
-        end_price = _price_on_or_before(close, end_dt, max_days=21)
-
-        if start_price not in [None, 0] and end_price is not None:
-            return float(end_price / start_price - 1)
-
-        # Fallback: trailing 1-year return to latest available close.
-        latest_date = close.index[-1]
-        latest_price = safe_float_value(close.iloc[-1])
-        one_year_ago = latest_date - pd.DateOffset(years=1)
-        start_price = _price_on_or_after(close, one_year_ago, max_days=21)
-
-        if start_price not in [None, 0] and latest_price is not None:
-            return float(latest_price / start_price - 1)
-
-        return None
-    except Exception:
-        return None
-
-
-def pull_yahoo_targets(symbol):
-    out = {
-        "Yahoo Ticker": symbol,
-        "Current Price": None,
-        "Target Low": None,
-        "Target Mean": None,
-        "Target High": None,
-        "Target Median": None,
-        "Analyst Count": None,
-        "Trailing PE": None,
-        "Forward PE": None,
-        "YTD Return": None,
-        "EPS Last Year": None,
-        "EPS This Year Est Avg": None,
-        "EPS Next Year Est Avg": None,
-        "Growth Last Year": None,
-        "Growth This Year Est": None,
-        "Growth Next Year Est": None,
-        "Yahoo Error": None,
-    }
-
-    try:
-        t = yf.Ticker(symbol)
-
-        try:
-            targets = t.get_analyst_price_targets()
-            if isinstance(targets, dict):
-                out.update({
-                    "Target Low": targets.get("low"),
-                    "Target Mean": targets.get("mean"),
-                    "Target High": targets.get("high"),
-                    "Target Median": targets.get("median"),
-                    "Analyst Count": targets.get("numberOfAnalysts"),
-                })
-            elif isinstance(targets, pd.DataFrame) and not targets.empty:
-                row = targets.iloc[0]
-                out.update({
-                    "Target Low": row.get("low"),
-                    "Target Mean": row.get("mean"),
-                    "Target High": row.get("high"),
-                    "Target Median": row.get("median"),
-                    "Analyst Count": row.get("numberOfAnalysts"),
-                })
-        except Exception as e:
-            out["Yahoo Error"] = f"target error: {e}"
-
-        try:
-            fast = t.fast_info
-            out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        except Exception:
-            pass
-
-        if out["Current Price"] is None or pd.isna(out["Current Price"]):
-            try:
-                hist = t.history(period="5d", auto_adjust=False)
-                if hist is not None and not hist.empty:
-                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
-            except Exception:
-                pass
-
-        try:
-            info = t.get_info()
-        except Exception:
-            try:
-                info = t.info
-            except Exception:
-                info = {}
-
-        if isinstance(info, dict):
-            out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
-            out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
-
-        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
-
-        try:
-            out.update(get_eps_and_growth_data(t))
-        except Exception as e:
-            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
-
-        # Hard override AFTER EPS/growth update so Yahoo Growth Estimates cannot blank it.
-        last_growth = get_last_calendar_year_stock_return_from_yahoo(symbol)
-        out["Growth Last Year"] = last_growth
-        if last_growth is None:
-            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + "Growth Last Year unavailable from adjusted price history"
-
-    except Exception as e:
-        out["Yahoo Error"] = str(e)
-
-    return out
-
-
-# ============================================================
-# VERIFIED HOTFIX v3: Growth Last Year = adjusted stock return
-# This block intentionally comes LAST, right before SCRIPT RUN.
-# It overrides earlier versions and fills blanks again after merge.
-# ============================================================
-
-REPORT_VERSION = "growth-last-year-adjusted-price-v3"
-
-
-def _growth_v3_ticker_variants(symbol):
-    s = str(symbol).strip()
-    variants = [s]
-
-    # Yahoo often uses BRK-B, while holdings can show BRK.B.
-    # Do not rewrite exchange suffixes like .TO, .HK, .T, .KS.
-    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s.upper()):
-        variants.append(s.replace(".", "-"))
-
-    return list(dict.fromkeys(variants))
-
-
-def _growth_v3_close_series(hist):
-    """Return a cleaned adjusted close series from yfinance output."""
-    try:
-        if hist is None or hist.empty:
-            return pd.Series(dtype=float)
-
-        if isinstance(hist.columns, pd.MultiIndex):
-            adj_cols = [c for c in hist.columns if str(c[0]).lower() == "adj close"]
-            close_cols = [c for c in hist.columns if str(c[0]).lower() == "close"]
-            chosen = adj_cols[0] if adj_cols else (close_cols[0] if close_cols else None)
-            if chosen is None:
-                return pd.Series(dtype=float)
-            close = hist[chosen]
-        else:
-            if "Adj Close" in hist.columns:
-                close = hist["Adj Close"]
-            elif "Close" in hist.columns:
-                close = hist["Close"]
-            else:
-                return pd.Series(dtype=float)
-
-        close = pd.to_numeric(close, errors="coerce").dropna()
-        if close.empty:
-            return pd.Series(dtype=float)
-
-        idx = pd.to_datetime(close.index, errors="coerce")
-        try:
-            idx = idx.tz_localize(None)
-        except Exception:
-            try:
-                idx = idx.tz_convert(None)
-            except Exception:
-                pass
-
-        close.index = idx
-        close = close[~close.index.isna()].sort_index()
-        return close
-    except Exception:
-        return pd.Series(dtype=float)
-
-
-def _growth_v3_download_close(symbol, start, end):
-    """Try several yfinance paths. Returns split/dividend adjusted close because auto_adjust=True."""
-    for sym in _growth_v3_ticker_variants(symbol):
-        # Date-range method.
-        for method in ["ticker_history", "download"]:
-            try:
-                if method == "ticker_history":
-                    hist = yf.Ticker(sym).history(
-                        start=pd.Timestamp(start).strftime("%Y-%m-%d"),
-                        end=pd.Timestamp(end).strftime("%Y-%m-%d"),
-                        auto_adjust=True,
-                        actions=False,
-                    )
-                else:
-                    hist = yf.download(
-                        sym,
-                        start=pd.Timestamp(start).strftime("%Y-%m-%d"),
-                        end=pd.Timestamp(end).strftime("%Y-%m-%d"),
-                        auto_adjust=True,
-                        progress=False,
-                        threads=False,
-                    )
-                close = _growth_v3_close_series(hist)
-                if len(close) >= 2:
-                    return close
-            except Exception:
-                pass
-
-        # Period fallback, then filter ourselves.
-        for period in ["3y", "5y", "2y"]:
-            for method in ["ticker_history", "download"]:
-                try:
-                    if method == "ticker_history":
-                        hist = yf.Ticker(sym).history(period=period, auto_adjust=True, actions=False)
-                    else:
-                        hist = yf.download(sym, period=period, auto_adjust=True, progress=False, threads=False)
-                    close = _growth_v3_close_series(hist)
-                    if len(close) >= 2:
-                        start_ts = pd.Timestamp(start)
-                        end_ts = pd.Timestamp(end)
-                        close = close[(close.index >= start_ts) & (close.index < end_ts)]
-                        if len(close) >= 2:
-                            return close
-                except Exception:
-                    pass
-
-    return pd.Series(dtype=float)
-
-
-def get_last_calendar_year_stock_return_from_yahoo(symbol):
-    """
-    Growth Last Year = previous full calendar-year stock return.
-
-    Example: if run in 2026, this calculates 2025 return:
-        last adjusted close in 2025 / first adjusted close in 2025 - 1
-
-    auto_adjust=True handles splits/reverse splits.
-    If a stock did not trade for enough of last year, falls back to trailing 1-year adjusted return.
-    """
-    try:
-        today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
-    except Exception:
-        today = pd.Timestamp.today()
-
-    last_year = today.year - 1
-    start = pd.Timestamp(year=last_year, month=1, day=1)
-    end = pd.Timestamp(year=today.year, month=1, day=1)
-
-    try:
-        close = _growth_v3_download_close(symbol, start, end)
-        if len(close) >= 2:
-            first_price = safe_float_value(close.iloc[0])
-            last_price = safe_float_value(close.iloc[-1])
-            if first_price not in [None, 0] and last_price is not None:
-                return float(last_price / first_price - 1)
-    except Exception:
-        pass
-
-    # Fallback: trailing 1-year adjusted return.
-    try:
-        end2 = today + pd.Timedelta(days=1)
-        start2 = today - pd.DateOffset(years=1)
-        close = _growth_v3_download_close(symbol, start2, end2)
-        if len(close) >= 2:
-            first_price = safe_float_value(close.iloc[0])
-            last_price = safe_float_value(close.iloc[-1])
-            if first_price not in [None, 0] and last_price is not None:
-                return float(last_price / first_price - 1)
-    except Exception:
-        pass
-
-    return None
-
-
-# Keep this name, but make it only return Yahoo Analysis Growth Estimates for this/next year.
-def get_eps_and_growth_data(ticker_obj):
-    eps_last_year = get_annual_eps_from_financials(ticker_obj)
-    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
-    _ignore_last, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
-
-    return {
-        "EPS Last Year": eps_last_year,
-        "EPS This Year Est Avg": eps_this_year,
-        "EPS Next Year Est Avg": eps_next_year,
-        "Growth This Year Est": growth_this_year,
-        "Growth Next Year Est": growth_next_year,
-    }
-
-
-def pull_yahoo_targets(symbol):
-    out = {
-        "Yahoo Ticker": symbol,
-        "Current Price": None,
-        "Target Low": None,
-        "Target Mean": None,
-        "Target High": None,
-        "Target Median": None,
-        "Analyst Count": None,
-        "Trailing PE": None,
-        "Forward PE": None,
-        "YTD Return": None,
-        "EPS Last Year": None,
-        "EPS This Year Est Avg": None,
-        "EPS Next Year Est Avg": None,
-        "Growth Last Year": None,
-        "Growth This Year Est": None,
-        "Growth Next Year Est": None,
-        "Yahoo Error": None,
-    }
-
-    try:
-        t = yf.Ticker(symbol)
-
-        try:
-            targets = t.get_analyst_price_targets()
-            if isinstance(targets, dict):
-                out["Target Low"] = targets.get("low")
-                out["Target Mean"] = targets.get("mean")
-                out["Target High"] = targets.get("high")
-                out["Target Median"] = targets.get("median")
-                out["Analyst Count"] = targets.get("numberOfAnalysts")
-            elif isinstance(targets, pd.DataFrame) and not targets.empty:
-                row = targets.iloc[0]
-                out["Target Low"] = row.get("low")
-                out["Target Mean"] = row.get("mean")
-                out["Target High"] = row.get("high")
-                out["Target Median"] = row.get("median")
-                out["Analyst Count"] = row.get("numberOfAnalysts")
-        except Exception as e:
-            out["Yahoo Error"] = f"target error: {e}"
-
-        try:
-            fast = t.fast_info
-            out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        except Exception:
-            pass
-
-        if out["Current Price"] is None or pd.isna(out["Current Price"]):
-            try:
-                hist = t.history(period="5d", auto_adjust=False)
-                if hist is not None and not hist.empty:
-                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
-            except Exception:
-                pass
-
-        try:
-            info = t.get_info()
-        except Exception:
-            try:
-                info = t.info
-            except Exception:
-                info = {}
-
-        if isinstance(info, dict):
-            out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
-            out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
-
-        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
-
-        try:
-            out.update(get_eps_and_growth_data(t))
-        except Exception as e:
-            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
-
-        # Final hard assignment after all updates. This cannot be overwritten by Yahoo Growth Estimates.
-        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
-        if out["Growth Last Year"] is None:
-            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + "Growth Last Year unavailable from adjusted price history"
-
-    except Exception as e:
-        out["Yahoo Error"] = str(e)
-
-    return out
-
-
-def add_yahoo_targets(holdings):
-    rows = []
-    symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
-
-    for i, symbol in enumerate(symbols, 1):
-        print(f"Yahoo targets + PE + YTD + EPS + Growth {i}/{len(symbols)}: {symbol}")
-        rows.append(pull_yahoo_targets(symbol))
-        time.sleep(YAHOO_SLEEP_SECONDS)
-
-    targets = pd.DataFrame(rows)
-    merged = holdings.merge(targets, on="Yahoo Ticker", how="left")
-
-    numeric_cols = [
-        "Current Price", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count",
-        "Trailing PE", "Forward PE", "YTD Return",
-        "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg",
-        "Growth Last Year", "Growth This Year Est", "Growth Next Year Est",
-    ]
-
-    for c in numeric_cols:
-        if c in merged.columns:
-            merged[c] = pd.to_numeric(merged[c], errors="coerce")
-
-    # Absolute final guard: if any row is still blank, try adjusted price history again by ticker.
-    if "Growth Last Year" in merged.columns:
-        missing = merged["Growth Last Year"].isna()
-        if missing.any():
-            for sym in merged.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
-                val = get_last_calendar_year_stock_return_from_yahoo(sym)
-                if val is not None:
-                    merged.loc[merged["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
-
-    return merged
-
-
-def prepare_detail_sheet(details):
-    df = details.copy()
-
-    # Final display guard: calculate Growth Last Year right before writing Excel if still missing.
-    if "Growth Last Year" not in df.columns:
-        df["Growth Last Year"] = np.nan
-    if "Yahoo Ticker" in df.columns:
-        missing = df["Growth Last Year"].isna()
-        if missing.any():
-            for sym in df.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
-                val = get_last_calendar_year_stock_return_from_yahoo(sym)
-                if val is not None:
-                    df.loc[df["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
-
-    out = pd.DataFrame()
-    out["Ticker"] = df["Yahoo Ticker"]
-    out["% of Portfolio"] = df["Weight Decimal"]
-    out["YTD"] = df["YTD Return"]
-    out["Worst"] = df["Low Return"]
-    out["Average"] = df["Mean Return"]
-    out["Median"] = df["Median Return"]
-    out["Best"] = df["High Return"]
-
-    out["Worst Target"] = df["Target Low"]
-    out["Average Target"] = df["Target Mean"]
-    out["Median Target"] = df["Target Median"]
-    out["Best Target"] = df["Target High"]
-    out["Current"] = df["Current Price"]
-
-    out["Current PE"] = df["Trailing PE"]
-    out["Forward PE"] = df["Forward PE"]
-
-    out["EPS Last Year"] = df["EPS Last Year"]
-    out["EPS This Year Est Avg"] = df["EPS This Year Est Avg"]
-    out["EPS Next Year Est Avg"] = df["EPS Next Year Est Avg"]
-
-    out["Growth Last Year"] = df["Growth Last Year"]
-    out["Growth This Year Est"] = df["Growth This Year Est"]
-    out["Growth Next Year Est"] = df["Growth Next Year Est"]
-
-    out = out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
-    return out
-
-
-_ORIGINAL_MAIN_WITH_EXCEL_V3 = main_with_excel
-
-def main_with_excel():
-    print(f"ETF analyst report version: {REPORT_VERSION}")
-    return _ORIGINAL_MAIN_WITH_EXCEL_V3()
-
-
-
-
-# ============================================================
-# FINAL OVERRIDE V4: PE HISTORY + SUMMARY PE CHARTS + USER'S ETF TAB FORMAT
-# ============================================================
-
-REPORT_VERSION = "pe-history-graphs-layout-v4"
+REPORT_VERSION = "pe-history-graphs-layout-v5-clean"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
+REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
 
 def get_report_years():
-    """Return labels for last year, current year, next year based on Toronto date."""
     today = pd.Timestamp.now(tz="America/Toronto")
     current_year = int(today.year)
     return current_year - 1, current_year, current_year + 1
 
 
 def update_pe_history(summaries, history_path=None):
-    """
-    Save ETF-level PE and Forward PE every time the script runs.
-    This file is designed to be committed back to GitHub by GitHub Actions.
-    """
-    if history_path is None:
-        history_path = PE_HISTORY_PATH
-    else:
-        history_path = Path(history_path)
-
+    history_path = Path(history_path) if history_path else PE_HISTORY_PATH
     history_path.parent.mkdir(parents=True, exist_ok=True)
     today = pd.Timestamp.now(tz="America/Toronto").date()
 
-    new_rows = []
-    for s in summaries:
-        new_rows.append({
+    new_df = pd.DataFrame([
+        {
             "Date": today,
             "ETF": s.get("ETF"),
             "PE Ratio": s.get("PE Ratio"),
@@ -2316,9 +1608,9 @@ def update_pe_history(summaries, history_path=None):
             "Forward PE coverage": s.get("Forward PE Coverage Weight"),
             "YTD": s.get("ETF YTD Return"),
             "Covered Weight": s.get("Covered Weight"),
-        })
-
-    new_df = pd.DataFrame(new_rows)
+        }
+        for s in summaries
+    ])
 
     if history_path.exists():
         try:
@@ -2335,16 +1627,13 @@ def update_pe_history(summaries, history_path=None):
     combined = combined.drop_duplicates(subset=["Date", "ETF"], keep="last")
     combined = combined.sort_values(["ETF", "Date"]).reset_index(drop=True)
     combined.to_excel(history_path, index=False)
+
     print(f"Saved PE history: {history_path}")
     return combined
 
 
 def load_pe_history(history_path=None):
-    if history_path is None:
-        history_path = PE_HISTORY_PATH
-    else:
-        history_path = Path(history_path)
-
+    history_path = Path(history_path) if history_path else PE_HISTORY_PATH
     if not history_path.exists():
         return pd.DataFrame(columns=["Date", "ETF", "PE Ratio", "Forward PE"])
 
@@ -2352,8 +1641,7 @@ def load_pe_history(history_path=None):
         hist = pd.read_excel(history_path)
         hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
         hist = hist.dropna(subset=["Date", "ETF"])
-        hist = hist.sort_values(["ETF", "Date"])
-        return hist
+        return hist.sort_values(["ETF", "Date"])
     except Exception as e:
         print(f"Could not load PE history: {e}")
         return pd.DataFrame(columns=["Date", "ETF", "PE Ratio", "Forward PE"])
@@ -2366,10 +1654,6 @@ def build_excel_summary_rows(summary_df):
         current_price = get_etf_current_price(etf)
         worst_return = r.get("Raw Worst Case Return")
 
-        worst_price = None
-        if current_price is not None and pd.notna(worst_return):
-            worst_price = current_price * (1 + worst_return)
-
         rows.append({
             "ETF": etf,
             "reliable": r.get("Covered Weight"),
@@ -2379,21 +1663,24 @@ def build_excel_summary_rows(summary_df):
             "WORST": r.get("Raw Worst Case Return"),
             "BEST": r.get("Raw Best Case Return"),
             "Current pr": current_price,
-            "worst price": worst_price,
+            "worst price": current_price * (1 + worst_return)
+            if current_price is not None and pd.notna(worst_return)
+            else None,
             "PE Ratio": r.get("PE Ratio"),
             "PE coverage": r.get("PE Coverage Weight"),
             "Forward PE": r.get("Forward PE"),
             "Forward PE coverage": r.get("Forward PE Coverage Weight"),
         })
+
     return pd.DataFrame(rows)
 
 
 def prepare_detail_sheet(details):
     df = details.copy()
 
-    # Final display guard: calculate Growth Last Year from adjusted price history if still missing.
     if "Growth Last Year" not in df.columns:
         df["Growth Last Year"] = np.nan
+
     if "Yahoo Ticker" in df.columns:
         missing = df["Growth Last Year"].isna()
         if missing.any():
@@ -2425,8 +1712,7 @@ def prepare_detail_sheet(details):
     out["EPS This Year Est Avg"] = df["EPS This Year Est Avg"]
     out["EPS Next Year Est Avg"] = df["EPS Next Year Est Avg"]
 
-    out = out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
-    return out
+    return out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
 
 
 def _write_number_or_dash(ws, row, col, val, num_fmt, dash_fmt):
@@ -2437,7 +1723,6 @@ def _write_number_or_dash(ws, row, col, val, num_fmt, dash_fmt):
 
 
 def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_history, chart_start_row, start_col=1):
-    """Put PE history line charts on the Summary sheet, below all other tables."""
     if pe_history is None or pe_history.empty:
         worksheet.write(chart_start_row, start_col, "PE history charts will appear after more runs are saved.")
         return
@@ -2445,10 +1730,6 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
     hist = pe_history.copy()
     hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
     hist = hist.dropna(subset=["Date", "ETF"])
-
-    if hist.empty:
-        worksheet.write(chart_start_row, start_col, "PE history charts will appear after more runs are saved.")
-        return
 
     cutoff = pd.Timestamp.now(tz="America/Toronto").tz_localize(None) - pd.DateOffset(years=1)
     hist_1y = hist[hist["Date"] >= cutoff].copy()
@@ -2482,22 +1763,14 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
 
     worksheet.write(chart_start_row, start_col, "PE history, last 1 year", workbook.add_format({"bold": True, "font_size": 12}))
 
-    etfs = [e for e in hist_1y["ETF"].dropna().astype(str).unique()]
-    chart_positions = []
-    for i, etf in enumerate(etfs):
-        # 2 charts per row, each chart roughly 8 rows tall.
+    for i, etf in enumerate(hist_1y["ETF"].dropna().astype(str).unique()):
         chart_row = chart_start_row + 2 + (i // 2) * 16
         chart_col = start_col + (i % 2) * 8
-        chart_positions.append((etf, chart_row, chart_col))
+        seq_positions = [j + 1 for j, (_, row) in enumerate(hist_1y.iterrows()) if str(row.get("ETF")) == etf]
 
-    for etf, chart_row, chart_col in chart_positions:
-        etf_rows = hist_1y.index[hist_1y["ETF"].astype(str) == etf].tolist()
-        if not etf_rows:
+        if not seq_positions:
             continue
-        # Convert dataframe position to worksheet row: header row is 0, data starts at 1.
-        first_data_pos = hist_1y.index.get_loc(etf_rows[0]) + 1 if hasattr(hist_1y.index, 'get_loc') else 1
-        # Safer: create map based on sequential writing order.
-        seq_positions = [i + 1 for i, (_, row) in enumerate(hist_1y.iterrows()) if str(row.get("ETF")) == etf]
+
         first_row = min(seq_positions)
         last_row = max(seq_positions)
 
@@ -2522,18 +1795,49 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
         worksheet.insert_chart(chart_row, chart_col, chart)
 
 
+def _make_edge_formats(workbook):
+    base = {"border": 1, "align": "center", "valign": "vcenter"}
+    return {
+        "top_left": workbook.add_format({**base, "top": 2, "left": 2}),
+        "top": workbook.add_format({**base, "top": 2}),
+        "top_right": workbook.add_format({**base, "top": 2, "right": 2}),
+        "left": workbook.add_format({**base, "left": 2}),
+        "right": workbook.add_format({**base, "right": 2}),
+        "bottom_left": workbook.add_format({**base, "bottom": 2, "left": 2}),
+        "bottom": workbook.add_format({**base, "bottom": 2}),
+        "bottom_right": workbook.add_format({**base, "bottom": 2, "right": 2}),
+    }
+
+
+def _apply_thick_outer_block(ws, edge_formats, first_row, first_col, last_row, last_col):
+    """Apply a thick outside border to a rectangular section without changing inner cell formats."""
+    for r in range(first_row, last_row + 1):
+        for c in range(first_col, last_col + 1):
+            if r == first_row and c == first_col:
+                fmt = edge_formats["top_left"]
+            elif r == first_row and c == last_col:
+                fmt = edge_formats["top_right"]
+            elif r == last_row and c == first_col:
+                fmt = edge_formats["bottom_left"]
+            elif r == last_row and c == last_col:
+                fmt = edge_formats["bottom_right"]
+            elif r == first_row:
+                fmt = edge_formats["top"]
+            elif r == last_row:
+                fmt = edge_formats["bottom"]
+            elif c == first_col:
+                fmt = edge_formats["left"]
+            elif c == last_col:
+                fmt = edge_formats["right"]
+            else:
+                continue
+
+            ws.conditional_format(r, c, r, c, {"type": "no_blanks", "format": fmt})
+            ws.conditional_format(r, c, r, c, {"type": "blanks", "format": fmt})
+
+
 def export_excel_report(all_details, summaries, output_path=None, report_date=None, pe_history=None):
-    """
-    Create formatted Excel report.
-    Summary:
-      ETF summary + Fear & Greed + VIX + PE history charts.
-    ETF tabs:
-      Match requested visual layout with grouped headers.
-    """
-    if output_path is None:
-        output_path = OUTPUT_DIR / "ETF_analyst_report.xlsx"
-    else:
-        output_path = Path(output_path)
+    output_path = Path(output_path) if output_path else REPORT_PATH
 
     if report_date is None:
         today = pd.Timestamp.now(tz="America/Toronto")
@@ -2545,19 +1849,17 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
     summary_rows = build_excel_summary_rows(summary_df)
     fear_greed_summary, fear_greed_error = build_fear_greed_summary()
     vix_summary, vix_error = build_vix_summary()
-
-    if pe_history is None:
-        pe_history = load_pe_history()
+    pe_history = load_pe_history() if pe_history is None else pe_history
 
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
         workbook = writer.book
 
-        title_fmt = workbook.add_format({
-            "bold": True, "font_size": 12, "align": "center", "valign": "vcenter", "border": 1,
-        })
-        section_fmt = workbook.add_format({"bold": True, "font_size": 12, "align": "left", "valign": "vcenter"})
         header_fmt = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#E2F0D9"})
         header_white_fmt = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#FFFFFF"})
+        section_fmt = workbook.add_format({"bold": True, "font_size": 12, "align": "left", "valign": "vcenter"})
+        group_header_fmt = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter", "border": 1, "bg_color": "#FFFFFF"})
+        blank_no_border_fmt = workbook.add_format({"align": "center", "valign": "vcenter"})
+
         normal_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter"})
         text_fmt = workbook.add_format({"border": 1, "align": "left", "valign": "vcenter"})
         pct_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
@@ -2569,26 +1871,13 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         int_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0"})
         total_pct_fmt = workbook.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
         total_text_fmt = workbook.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter"})
-        group_header_fmt = workbook.add_format({
-                "bold": True,
-                "align": "center",
-                "valign": "vcenter",
-                "border": 2,
-                "bg_color": "#FFFFFF",
-            })
-        blank_no_border_fmt = workbook.add_format({"align": "center", "valign": "vcenter"})
+        edge_formats = _make_edge_formats(workbook)
 
-        # ====================================================
-        # Summary sheet
-        # ====================================================
-        sheet_name = "Summary"
-        worksheet = workbook.add_worksheet(sheet_name)
-        writer.sheets[sheet_name] = worksheet
+        # ---------------- Summary sheet ----------------
+        worksheet = workbook.add_worksheet("Summary")
+        writer.sheets["Summary"] = worksheet
 
-        headers = [
-            "", "reliable", "YTD", "Average", "Median", "WORST", "BEST",
-            "Current pr", "worst price", "PE Ratio", "PE coverage", "Forward PE", "Forward PE coverage",
-        ]
+        headers = ["", "reliable", "YTD", "Average", "Median", "WORST", "BEST", "Current pr", "worst price", "PE Ratio", "PE coverage", "Forward PE", "Forward PE coverage"]
         start_row = 3
         start_col = 1
         worksheet.write(start_row, start_col, report_date, header_fmt)
@@ -2615,19 +1904,17 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         worksheet.conditional_format(f"D5:H{end_row + 1}", {"type": "cell", "criteria": "<", "value": 0, "format": pct_red_fmt})
         worksheet.conditional_format(f"D5:H{end_row + 1}", {"type": "cell", "criteria": ">=", "value": 0.3, "format": pct_green_fill_fmt})
 
-        # Fear & Greed block
         fg_start = end_row + 4
         worksheet.write(fg_start, start_col, "Fear & Greed Index", section_fmt)
         if fear_greed_error:
             worksheet.write(fg_start + 1, start_col, f"Fear & Greed data unavailable: {fear_greed_error}", text_fmt)
             vix_start = fg_start + 4
         else:
-            fg_headers = list(fear_greed_summary.columns)
-            for j, h in enumerate(fg_headers, start_col):
+            for j, h in enumerate(fear_greed_summary.columns, start_col):
                 worksheet.write(fg_start + 1, j, h, header_white_fmt)
             for i, row in fear_greed_summary.iterrows():
                 rr = fg_start + 2 + i
-                for j, h in enumerate(fg_headers, start_col):
+                for j, h in enumerate(fear_greed_summary.columns, start_col):
                     val = row[h]
                     if h == "Score":
                         worksheet.write_number(rr, j, float(val), number_fmt)
@@ -2635,18 +1922,16 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                         worksheet.write(rr, j, str(val), text_fmt if h in ["Metric", "Rating", "Source"] else normal_fmt)
             vix_start = fg_start + 5
 
-        # VIX block
         worksheet.write(vix_start, start_col, "VIX percentile analysis", section_fmt)
         if vix_error:
             worksheet.write(vix_start + 1, start_col, f"VIX data unavailable: {vix_error}", text_fmt)
             chart_start = vix_start + 4
         else:
-            vix_headers = list(vix_summary.columns)
-            for j, h in enumerate(vix_headers, start_col):
+            for j, h in enumerate(vix_summary.columns, start_col):
                 worksheet.write(vix_start + 1, j, h, header_white_fmt)
             for i, row in vix_summary.iterrows():
                 rr = vix_start + 2 + i
-                for j, h in enumerate(vix_headers, start_col):
+                for j, h in enumerate(vix_summary.columns, start_col):
                     val = row[h]
                     if h == "Period":
                         worksheet.write(rr, j, val, text_fmt)
@@ -2665,12 +1950,9 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         worksheet.set_column("B:B", 14)
         worksheet.set_column("C:H", 12)
         worksheet.set_column("I:N", 14)
-        worksheet.set_column("O:P", 15)
         worksheet.freeze_panes(start_row + 1, 0)
 
-        # ====================================================
-        # ETF detail sheets, requested visual format
-        # ====================================================
+        # ---------------- ETF detail sheets ----------------
         for details in all_details:
             if details.empty:
                 continue
@@ -2682,9 +1964,9 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                 etf.replace(".", "_").replace("/", "_").replace("\\", "_")
                 .replace("?", "_").replace("*", "_").replace("[", "_")
                 .replace("]", "_").replace(":", "_")
-            )
-            safe_sheet_base = safe_sheet_base[:31] if safe_sheet_base else f"ETF_{len(writer.sheets)}"
-            safe_sheet = safe_sheet_base
+            )[:31]
+
+            safe_sheet = safe_sheet_base or f"ETF_{len(writer.sheets)}"
             counter = 1
             used_sheets_lower = {name.lower() for name in writer.sheets.keys()}
             while safe_sheet.lower() in used_sheets_lower:
@@ -2696,7 +1978,6 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
             ws = workbook.add_worksheet(safe_sheet)
             writer.sheets[safe_sheet] = ws
 
-            # Row 1 group headers, matching the screenshot layout.
             ws.write(0, 0, report_date, group_header_fmt)
             ws.write(0, 1, "Weight", group_header_fmt)
             ws.write(0, 2, "YTD", group_header_fmt)
@@ -2709,17 +1990,18 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
             ws.merge_range(0, 15, 0, 18, "12-month estimate price target", group_header_fmt)
             ws.merge_range(0, 19, 0, 21, "EPS (Est Avg)", group_header_fmt)
 
-            # Row 2 column headers.
             headers2 = [
-                etf, "% of Portfolio", "YTD", "Worst", "Average", "Median", "Best", "",
-                "Current", "Current", "Forward",
+                etf, "% of Portfolio", "YTD",
+                "Worst", "Average", "Median", "Best", "",
+                "Current",
+                "Current", "Forward",
                 str(last_year), str(current_year), str(next_year), "",
                 "Worst", "Average", "Median", "Best",
                 str(last_year), str(current_year), str(next_year),
             ]
+
             for c, h in enumerate(headers2):
-                fmt = blank_no_border_fmt if c in [7, 14] else header_white_fmt
-                ws.write(1, c, h, fmt)
+                ws.write(1, c, h, blank_no_border_fmt if c in [7, 14] else header_white_fmt)
 
             data_start = 2
             for i, row in detail.iterrows():
@@ -2750,6 +2032,8 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
             total_row = data_start + len(detail) + 2
             first_excel_row = data_start + 1
             last_excel_row = data_start + len(detail)
+            last_data_row = last_excel_row - 1
+
             ws.write(total_row, 0, "TOTAL", total_text_fmt)
             ws.write_formula(total_row, 1, f"=SUM(B{first_excel_row}:B{last_excel_row})", total_pct_fmt)
             ws.write_formula(total_row, 2, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},C{first_excel_row}:C{last_excel_row})", total_pct_fmt)
@@ -2758,11 +2042,19 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
             ws.write_formula(total_row, 5, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},F{first_excel_row}:F{last_excel_row})", total_pct_fmt)
             ws.write_formula(total_row, 6, f"=SUMPRODUCT(B{first_excel_row}:B{last_excel_row},G{first_excel_row}:G{last_excel_row})", total_pct_fmt)
 
-            # Color negative / high values similar to existing style.
             ws.conditional_format(f"C3:G{last_excel_row}", {"type": "cell", "criteria": "<", "value": 0, "format": pct_red_fmt})
             ws.conditional_format(f"C3:G{last_excel_row}", {"type": "cell", "criteria": ">=", "value": 0.3, "format": pct_green_fill_fmt})
             ws.conditional_format(f"L3:N{last_excel_row}", {"type": "cell", "criteria": "<", "value": 0, "format": pct_red_fmt})
             ws.conditional_format(f"L3:N{last_excel_row}", {"type": "cell", "criteria": ">=", "value": 0.3, "format": pct_green_fill_fmt})
+
+            # Thick outside blocks: title row + subheader row + all data rows.
+            if len(detail) > 0:
+                _apply_thick_outer_block(ws, edge_formats, 0, 3, last_data_row, 6)    # Analyst Target Return
+                _apply_thick_outer_block(ws, edge_formats, 0, 8, last_data_row, 8)    # Price
+                _apply_thick_outer_block(ws, edge_formats, 0, 9, last_data_row, 10)   # PE ratio
+                _apply_thick_outer_block(ws, edge_formats, 0, 11, last_data_row, 13)  # Growth
+                _apply_thick_outer_block(ws, edge_formats, 0, 15, last_data_row, 18)  # 12-month estimate price target
+                _apply_thick_outer_block(ws, edge_formats, 0, 19, last_data_row, 21)  # EPS (Est Avg)
 
             ws.freeze_panes(2, 1)
             ws.set_column("A:A", 11)
@@ -2781,10 +2073,40 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         return output_path
 
 
-_ORIGINAL_MAIN_WITH_EXCEL_V4_BASE = main_with_excel
+# ============================================================
+# RUNNERS
+# ============================================================
+
+def run_one_etf(etf):
+    if etf.upper() == "TECH":
+        etf = "TECH.TO"
+    if etf.upper() == "CHPS":
+        etf = "CHPS.TO"
+
+    holdings = pull_issuer_holdings(etf)
+    enriched = calculate_returns(add_yahoo_targets(holdings))
+    summary = summarize_etf(enriched, etf)
+    print_summary(summary)
+
+    output_cols = [
+        "ETF", "Yahoo Ticker", "Raw Ticker", "Name", "Weight", "Weight Decimal",
+        "Current Price", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count",
+        "Trailing PE", "Forward PE", "YTD Return",
+        "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg",
+        "Growth Last Year", "Growth This Year Est", "Growth Next Year Est",
+        "Low Return", "Mean Return", "High Return", "Median Return",
+        "Weighted Low Return", "Weighted Mean Return", "Weighted High Return", "Weighted Median Return",
+        "Shares Held", "Identifier", "Source Note", "Yahoo Error",
+    ]
+
+    enriched = enriched[[c for c in output_cols if c in enriched.columns]]
+    enriched = enriched.sort_values("Weight", ascending=False).reset_index(drop=True)
+    return enriched, summary
+
 
 def main_with_excel():
     print(f"ETF analyst report version: {REPORT_VERSION}")
+
     all_details = []
     summaries = []
     failures = []
@@ -2811,6 +2133,11 @@ def main_with_excel():
             print(f"{f['ETF']}: {f['Error']}")
 
     return all_details, summaries, failures
+
+
+def main():
+    return main_with_excel()
+
 
 # ============================================================
 # SCRIPT RUN
