@@ -1582,7 +1582,7 @@ def build_fear_greed_summary():
 # EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-REPORT_VERSION = "pe-history-graphs-layout-v8-hardcoded-summary-k-l"
+REPORT_VERSION = "pe-history-graphs-layout-v9-etf-overlap"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
 REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
@@ -1834,6 +1834,207 @@ def _apply_thick_outer_block(ws, edge_formats, first_row, first_col, last_row, l
 
             ws.conditional_format(r, c, r, c, {"type": "no_blanks", "format": fmt})
             ws.conditional_format(r, c, r, c, {"type": "blanks", "format": fmt})
+
+
+
+
+def _write_etf_overlap_sheet(workbook, writer, all_details):
+    """
+    Creates an interactive ETF Overlap tab.
+
+    User can type/select any two ETFs from this report in B2 and B3.
+    The sheet shows overlapping tickers, overlap count, ETF 1 overlap weight,
+    ETF 2 overlap weight, and overlap by minimum weight.
+
+    Requires modern Excel / Excel 365 for LET, FILTER, XMATCH, XLOOKUP, HSTACK, SORTBY.
+    """
+    rows = []
+
+    for details in all_details:
+        if details is None or details.empty:
+            continue
+
+        required_cols = ["ETF", "Yahoo Ticker", "Name", "Weight Decimal"]
+        if any(c not in details.columns for c in required_cols):
+            continue
+
+        temp = details[required_cols].copy()
+        temp = temp.dropna(subset=["ETF", "Yahoo Ticker", "Weight Decimal"])
+
+        for _, r in temp.iterrows():
+            try:
+                weight = float(r["Weight Decimal"])
+            except Exception:
+                continue
+
+            rows.append({
+                "ETF": str(r["ETF"]).strip(),
+                "Ticker": str(r["Yahoo Ticker"]).strip(),
+                "Name": "" if pd.isna(r["Name"]) else str(r["Name"]).strip(),
+                "Weight": weight,
+            })
+
+    overlap_data = pd.DataFrame(rows)
+
+    if overlap_data.empty:
+        ws = workbook.add_worksheet("ETF Overlap")
+        writer.sheets["ETF Overlap"] = ws
+        ws.write(0, 0, "No overlap data available.")
+        return
+
+    overlap_data = (
+        overlap_data
+        .drop_duplicates(subset=["ETF", "Ticker"], keep="first")
+        .sort_values(["ETF", "Weight"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+
+    data_ws = workbook.add_worksheet("Overlap_Data")
+    writer.sheets["Overlap_Data"] = data_ws
+
+    data_headers = ["ETF", "Ticker", "Name", "Weight"]
+    for c, h in enumerate(data_headers):
+        data_ws.write(0, c, h)
+
+    pct_fmt_data = workbook.add_format({"num_format": "0.00%"})
+
+    for r, row in overlap_data.iterrows():
+        excel_row = r + 1
+        data_ws.write(excel_row, 0, row["ETF"])
+        data_ws.write(excel_row, 1, row["Ticker"])
+        data_ws.write(excel_row, 2, row["Name"])
+        data_ws.write_number(excel_row, 3, row["Weight"], pct_fmt_data)
+
+    data_ws.set_column("A:A", 14)
+    data_ws.set_column("B:B", 16)
+    data_ws.set_column("C:C", 38)
+    data_ws.set_column("D:D", 14)
+    data_ws.hide()
+
+    data_last_row = len(overlap_data) + 1
+
+    ws = workbook.add_worksheet("ETF Overlap")
+    writer.sheets["ETF Overlap"] = ws
+
+    title_fmt = workbook.add_format({"bold": True, "font_size": 14, "align": "left", "valign": "vcenter"})
+    label_fmt = workbook.add_format({"bold": True, "border": 1, "align": "left", "valign": "vcenter", "bg_color": "#E2F0D9"})
+    input_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "bg_color": "#FFF2CC"})
+    header_fmt = workbook.add_format({"bold": True, "border": 1, "align": "center", "valign": "vcenter", "bg_color": "#D9EAF7"})
+    text_fmt = workbook.add_format({"border": 1, "align": "left", "valign": "vcenter"})
+    center_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter"})
+    number_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "#,##0"})
+    pct_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter", "num_format": "0.00%"})
+    note_fmt = workbook.add_format({"italic": True, "font_color": "#666666"})
+
+    etf_list = sorted(overlap_data["ETF"].dropna().astype(str).unique())
+
+    ws.write(0, 0, "ETF Overlap", title_fmt)
+    ws.write(1, 0, "ETF 1", label_fmt)
+    ws.write(1, 1, etf_list[0] if len(etf_list) >= 1 else "", input_fmt)
+    ws.write(2, 0, "ETF 2", label_fmt)
+    ws.write(2, 1, etf_list[1] if len(etf_list) >= 2 else etf_list[0], input_fmt)
+
+    ws.write(1, 3, "Type or select any ETF from this Excel report.", note_fmt)
+    ws.write(2, 3, "The overlap table updates when Excel recalculates.", note_fmt)
+
+    ws.write(0, 10, "ETF List")
+    for i, etf in enumerate(etf_list, start=1):
+        ws.write(i, 10, etf)
+
+    list_last_row = len(etf_list) + 1
+    validation_source = f"='ETF Overlap'!$K$2:$K${list_last_row}"
+    ws.data_validation("B2", {"validate": "list", "source": validation_source})
+    ws.data_validation("B3", {"validate": "list", "source": validation_source})
+    ws.set_column("K:K", 0, None, {"hidden": True})
+
+    ws.write(4, 0, "Metric", header_fmt)
+    ws.write(4, 1, "Value", header_fmt)
+
+    ws.write(5, 0, "Number of overlapping stocks", text_fmt)
+    ws.write_formula(
+        5, 1,
+        f'=IFERROR(LET(e1,$B$2,e2,$B$3,'
+        f't1,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f't2,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'ROWS(FILTER(t1,ISNUMBER(XMATCH(t1,t2))))),0)',
+        number_fmt
+    )
+
+    ws.write(6, 0, "ETF 1 overlapping weight", text_fmt)
+    ws.write_formula(
+        6, 1,
+        f'=IFERROR(LET(e1,$B$2,e2,$B$3,'
+        f't1,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f'w1,FILTER(Overlap_Data!$D$2:$D${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f't2,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'SUM(FILTER(w1,ISNUMBER(XMATCH(t1,t2))))),0)',
+        pct_fmt
+    )
+
+    ws.write(7, 0, "ETF 2 overlapping weight", text_fmt)
+    ws.write_formula(
+        7, 1,
+        f'=IFERROR(LET(e1,$B$2,e2,$B$3,'
+        f't1,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f't2,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'w2,FILTER(Overlap_Data!$D$2:$D${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'SUM(FILTER(w2,ISNUMBER(XMATCH(t2,t1))))),0)',
+        pct_fmt
+    )
+
+    ws.write(8, 0, "Overlap by minimum weight", text_fmt)
+    ws.write_formula(
+        8, 1,
+        f'=IFERROR(LET(e1,$B$2,e2,$B$3,'
+        f't1,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f't2,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'w1,FILTER(Overlap_Data!$D$2:$D${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f'w2,FILTER(Overlap_Data!$D$2:$D${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'common,FILTER(t1,ISNUMBER(XMATCH(t1,t2))),'
+        f'cw1,XLOOKUP(common,t1,w1),'
+        f'cw2,XLOOKUP(common,t2,w2),'
+        f'SUM(IF(cw1<cw2,cw1,cw2))),0)',
+        pct_fmt
+    )
+
+    ws.write(9, 0, "Selected ETF 1", text_fmt)
+    ws.write_formula(9, 1, "=$B$2", center_fmt)
+    ws.write(10, 0, "Selected ETF 2", text_fmt)
+    ws.write_formula(10, 1, "=$B$3", center_fmt)
+
+    table_start = 12
+    table_headers = ["Ticker", "Name", "ETF 1 Weight", "ETF 2 Weight", "Min Weight"]
+    for c, h in enumerate(table_headers):
+        ws.write(table_start, c, h, header_fmt)
+
+    ws.write_formula(
+        table_start + 1, 0,
+        f'=IFERROR(LET(e1,$B$2,e2,$B$3,'
+        f't1,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f'n1,FILTER(Overlap_Data!$C$2:$C${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f'w1,FILTER(Overlap_Data!$D$2:$D${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e1),'
+        f't2,FILTER(Overlap_Data!$B$2:$B${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'w2,FILTER(Overlap_Data!$D$2:$D${data_last_row},Overlap_Data!$A$2:$A${data_last_row}=e2),'
+        f'common,FILTER(t1,ISNUMBER(XMATCH(t1,t2))),'
+        f'cw1,XLOOKUP(common,t1,w1),'
+        f'cw2,XLOOKUP(common,t2,w2),'
+        f'cn,XLOOKUP(common,t1,n1),'
+        f'SORTBY(HSTACK(common,cn,cw1,cw2,IF(cw1<cw2,cw1,cw2)),IF(cw1<cw2,cw1,cw2),-1)),"No overlap found")'
+    )
+
+    # Pre-format a generous output area for the dynamic array.
+    max_table_rows = min(len(overlap_data) + 20, 1500)
+    for r in range(table_start + 1, table_start + max_table_rows):
+        ws.set_row(r, 18)
+    ws.conditional_format(table_start + 1, 0, table_start + max_table_rows, 1, {"type": "no_errors", "format": text_fmt})
+    ws.conditional_format(table_start + 1, 2, table_start + max_table_rows, 4, {"type": "no_errors", "format": pct_fmt})
+
+    ws.set_column("A:A", 16)
+    ws.set_column("B:B", 40)
+    ws.set_column("C:E", 16)
+    ws.set_column("D:D", 16)
+    ws.set_column("E:E", 16)
+    ws.freeze_panes(table_start + 1, 0)
 
 
 def export_excel_report(all_details, summaries, output_path=None, report_date=None, pe_history=None):
@@ -2092,6 +2293,9 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
             ws.set_column("P:S", 12)
             ws.set_column("T:V", 11)
             ws.set_default_row(18)
+
+        # ---------------- ETF Overlap sheet ----------------
+        _write_etf_overlap_sheet(workbook, writer, all_details)
 
         print(f"Saved Excel report: {output_path}")
         return output_path
