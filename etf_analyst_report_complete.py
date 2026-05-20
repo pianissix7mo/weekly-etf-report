@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 # SETTINGS
 # ============================================================
 
-ETFS = ["SPMO", "MAGS", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
+ETFS = ["SPMO", "MAGS", "CHAT", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
 OUTPUT_DIR = Path("etf_analyst_target_outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -58,9 +58,14 @@ ETF_CONFIG = {
     "SPMO": {"issuer": "Invesco official page browser-captured holdings API", "url": INVESCO_OFFICIAL_PAGE_URLS["SPMO"]},
     "QQQ": {"issuer": "Invesco official page browser-captured holdings API", "url": INVESCO_OFFICIAL_PAGE_URLS["QQQ"]},
     "MAGS": {
-        "issuer": "Roundhill live Top Holdings",
+        "issuer": "Roundhill live holdings",
         "url": "https://www.roundhillinvestments.com/etf/mags/",
         "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/MAGS_Factsheet.pdf",
+    },
+    "CHAT": {
+        "issuer": "Roundhill live holdings",
+        "url": "https://www.roundhillinvestments.com/etf/chat/",
+        "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/CHAT_Factsheet.pdf",
     },
     "TECH.TO": {
         "issuer": "Evolve ETFs",
@@ -782,18 +787,118 @@ def parse_mags_top_holdings_from_text(text, source_name="Roundhill text"):
 
 
 def pull_mags_roundhill_issuer_page():
-    url = ETF_CONFIG["MAGS"]["url"]
+    return pull_roundhill_issuer_page("MAGS")
+
+
+def pull_chat_roundhill_issuer_page():
+    return pull_roundhill_issuer_page("CHAT")
+
+
+def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
+    """
+    Generic Roundhill holdings validator for MAGS/CHAT.
+
+    It accepts the real holdings table/CSV from Roundhill and validates it after
+    passing through normalize_holdings(), so we do not rely on hard-coded equal
+    weights or fixed top-holding lists.
+    """
+    test = normalize_holdings(raw, etf)
+
+    if min_rows is None:
+        min_rows = 7 if etf == "MAGS" else 20
+
+    if len(test) < min_rows:
+        raise ValueError(f"{etf} {source_name}: only {len(test)} rows")
+
+    total = test["Weight"].sum()
+    if total < 85 or total > 115:
+        raise ValueError(f"{etf} {source_name}: bad total {total:.2f}%")
+
+    return raw
+
+
+def pull_roundhill_issuer_page(etf):
+    """
+    Pull Roundhill ETF holdings, currently used for MAGS and CHAT.
+
+    Order of attempts:
+      1. Static HTML tables from the issuer page.
+      2. Rendered browser download, preferably Download CSV.
+      3. Rendered HTML tables.
+      4. Factsheet text fallback. For MAGS, keep the old 7-stock parser because
+         the fund is intentionally only Magnificent Seven names.
+    """
+    etf = etf.upper()
+    url = ETF_CONFIG[etf]["url"]
     errors = []
-    for label, func in [
-        ("Roundhill requests text", lambda: parse_mags_top_holdings_from_text(BeautifulSoup(requests_get(url).text, "html.parser").get_text("\n", strip=True), "Roundhill requests text")),
-        ("Roundhill rendered page", lambda: parse_mags_top_holdings_from_text(fetch_rendered_artifacts(url, click_texts=["Top Holdings"], download_texts=["Download CSV", "CSV"], wait_seconds=5)["text"], "Roundhill rendered page")),
-        ("Roundhill factsheet", lambda: parse_mags_top_holdings_from_text(extract_pdf_text_from_bytes(requests_get(ETF_CONFIG["MAGS"]["factsheet_url"]).content), "Roundhill factsheet")),
-    ]:
+
+    # Fast path: static tables, if Roundhill exposes them directly.
+    try:
+        r = requests_get(url)
+        for i, table in enumerate(pd.read_html(StringIO(r.text))):
+            try:
+                raw = standardize_roundhill_candidate(table, etf, f"Roundhill static HTML table {i}")
+                print(f"{etf} holdings source used: Roundhill static HTML table {i}")
+                return raw
+            except Exception as e:
+                errors.append(f"static table {i}: {repr(e)}")
+    except Exception as e:
+        errors.append(f"static request/tables: {repr(e)}")
+
+    # Most reliable path for current Roundhill pages: render page, then click/download CSV.
+    try:
+        art = fetch_rendered_artifacts(
+            url,
+            click_texts=["Top Holdings", "View All", "View All +", "Holdings"],
+            download_texts=["Download CSV", "CSV", "Export"],
+            wait_seconds=7,
+        )
+
+        if art.get("download_bytes"):
+            for i, df in enumerate(read_any_file_to_tables(art["download_bytes"])):
+                try:
+                    raw = standardize_roundhill_candidate(df, etf, f"Roundhill rendered CSV/download table {i}")
+                    print(f"{etf} holdings source used: Roundhill rendered CSV/download")
+                    return raw
+                except Exception as e:
+                    errors.append(f"rendered download table {i}: {repr(e)}")
+
         try:
-            raw = func(); print(f"MAGS holdings source used: {label}"); return raw
+            for i, table in enumerate(pd.read_html(StringIO(art.get("html", "")))):
+                try:
+                    raw = standardize_roundhill_candidate(table, etf, f"Roundhill rendered HTML table {i}")
+                    print(f"{etf} holdings source used: Roundhill rendered HTML table {i}")
+                    return raw
+                except Exception as e:
+                    errors.append(f"rendered HTML table {i}: {repr(e)}")
         except Exception as e:
-            errors.append(f"{label}: {repr(e)}")
-    raise ValueError("MAGS actual weights could not be parsed. No equal 100/7 fallback used. Attempts:\n - " + "\n - ".join(errors))
+            errors.append(f"rendered HTML tables: {repr(e)}")
+
+        # MAGS-specific fallback from the earlier working parser.
+        if etf == "MAGS":
+            try:
+                raw = parse_mags_top_holdings_from_text(art.get("text", ""), "Roundhill rendered page text")
+                print("MAGS holdings source used: Roundhill rendered page text")
+                return raw
+            except Exception as e:
+                errors.append(f"MAGS rendered text fallback: {repr(e)}")
+
+    except Exception as e:
+        errors.append(f"rendered page/download: {repr(e)}")
+
+    # Factsheet fallback.
+    factsheet_url = ETF_CONFIG.get(etf, {}).get("factsheet_url")
+    if factsheet_url:
+        try:
+            pdf_text = extract_pdf_text_from_bytes(requests_get(factsheet_url).content)
+            if etf == "MAGS":
+                raw = parse_mags_top_holdings_from_text(pdf_text, "Roundhill factsheet")
+                print("MAGS holdings source used: Roundhill factsheet")
+                return raw
+        except Exception as e:
+            errors.append(f"factsheet fallback: {repr(e)}")
+
+    raise ValueError(f"{etf} Roundhill holdings could not be parsed. Attempts:\n - " + "\n - ".join(errors))
 
 
 def standardize_smh_candidate(raw, source_name):
@@ -1046,6 +1151,7 @@ def pull_issuer_holdings(etf):
     if etf == "SPMO": raw = pull_spmo_invesco_browser()
     elif etf == "QQQ": raw = pull_qqq_invesco_browser()
     elif etf == "MAGS": raw = pull_mags_roundhill_issuer_page()
+    elif etf == "CHAT": raw = pull_chat_roundhill_issuer_page()
     elif etf == "TECH.TO": raw = pull_evolve_tech_csv()
     elif etf == "CHPS.TO": raw = pull_globalx_chps_page()
     elif etf == "SOXX": raw = pull_blackrock_soxx()
@@ -1054,6 +1160,7 @@ def pull_issuer_holdings(etf):
     else: raise ValueError(f"No ETF config found for {etf}")
     holdings = normalize_holdings(raw, etf)
     if etf == "MAGS": sanity_check_weight_total(holdings, etf, low=90, high=120)
+    elif etf == "CHAT": sanity_check_weight_total(holdings, etf, low=85, high=115)
     elif etf == "SMH": sanity_check_weight_total(holdings, etf, low=90, high=105)
     elif etf == "SOXX": sanity_check_weight_total(holdings, etf, low=85, high=110)
     elif etf in ["SPMO", "QQQ"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
@@ -1073,6 +1180,11 @@ NUMERIC_YAHOO_COLUMNS = [
     "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg",
     "Growth Last Year", "Growth This Year Est", "Growth Next Year Est",
 ]
+
+# Small runtime optimization:
+# Many ETFs share the same holdings, so cache Yahoo responses in one run.
+# This avoids asking Yahoo for AAPL/MSFT/NVDA/etc. again for every ETF tab.
+YAHOO_TARGET_CACHE = {}
 
 
 def get_ytd_return_from_yahoo(symbol):
@@ -1518,8 +1630,15 @@ def add_yahoo_targets(holdings):
     symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
 
     for i, symbol in enumerate(symbols, 1):
+        if symbol in YAHOO_TARGET_CACHE:
+            print(f"Yahoo targets cached {i}/{len(symbols)}: {symbol}")
+            rows.append(YAHOO_TARGET_CACHE[symbol].copy())
+            continue
+
         print(f"Yahoo targets + PE + YTD + EPS + Growth {i}/{len(symbols)}: {symbol}")
-        rows.append(pull_yahoo_targets(symbol))
+        row = pull_yahoo_targets(symbol)
+        YAHOO_TARGET_CACHE[symbol] = row.copy()
+        rows.append(row)
         time.sleep(YAHOO_SLEEP_SECONDS)
 
     targets = pd.DataFrame(rows)
