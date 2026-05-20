@@ -30,8 +30,13 @@ jobs:
           pip install pandas numpy requests yfinance beautifulsoup4 XlsxWriter openpyxl lxml html5lib pypdf playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run ETF analyst report
-        run: python etf_analyst_report_complete.py
+      - name: Run ETF analyst report with retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 2
+          retry_wait_seconds: 60
+          command: python etf_analyst_report_complete.py
 
       - name: Send ETF report email
         env:
