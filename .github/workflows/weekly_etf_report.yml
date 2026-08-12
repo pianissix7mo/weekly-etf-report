@@ -3,7 +3,7 @@ name: ETF Analyst Report
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 16 * * 1-5"
+    - cron: "15 16 * * 1-5"
       timezone: "America/Toronto"
 
 permissions:
