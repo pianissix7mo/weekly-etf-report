@@ -3,8 +3,8 @@ name: ETF Analyst Report
 on:
   workflow_dispatch:
   schedule:
-    # 7 PM Toronto during daylight saving time = 23:00 UTC
-    - cron: "0 23 * * 1-5"
+    - cron: "0 16 * * 1-5"
+      timezone: "America/Toronto"
 
 permissions:
   contents: write
