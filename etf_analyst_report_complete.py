@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -47,6 +48,8 @@ from etf_report.config import (
     PLAYWRIGHT_TIMEOUT_SECONDS,
     SHARES_COLS,
     TICKER_COLS,
+    YAHOO_MAX_WORKERS,
+    YAHOO_RETRY_MISSING_GROWTH,
     YAHOO_SLEEP_SECONDS,
 )
 from etf_report.errors import (
@@ -54,7 +57,7 @@ from etf_report.errors import (
     ReportIncompleteError,
     SourceSchemaChangedError,
 )
-from etf_report.tickers import looks_like_bad_row, map_to_yahoo_symbol
+from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_to_yahoo_symbol
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1084,6 +1087,7 @@ NUMERIC_YAHOO_COLUMNS = [
 # Many ETFs share the same holdings, so cache Yahoo responses in one run.
 # This avoids asking Yahoo for AAPL/MSFT/NVDA/etc. again for every ETF tab.
 YAHOO_TARGET_CACHE = {}
+YAHOO_FETCH_TIMINGS = {}
 
 
 def get_ytd_return_from_yahoo(symbol):
@@ -1356,7 +1360,7 @@ def get_annual_eps_from_financials(ticker_obj):
     return None
 
 
-def get_eps_estimates_from_yfinance(ticker_obj):
+def get_eps_estimates_from_yfinance(ticker_obj, info=None):
     df = get_yf_dataframe(ticker_obj, ["get_earnings_estimate", "earnings_estimate"])
     eps_this_year = None
     eps_next_year = None
@@ -1365,13 +1369,14 @@ def get_eps_estimates_from_yfinance(ticker_obj):
         eps_this_year = row_average_value(find_estimate_row(df, ["0y", "current year", "currentyear", "current fiscal year"]))
         eps_next_year = row_average_value(find_estimate_row(df, ["+1y", "next year", "nextyear", "next fiscal year"]))
 
-    try:
-        info = ticker_obj.get_info()
-    except Exception:
+    if not isinstance(info, dict):
         try:
-            info = ticker_obj.info
+            info = ticker_obj.get_info()
         except Exception:
-            info = {}
+            try:
+                info = ticker_obj.info
+            except Exception:
+                info = {}
 
     if isinstance(info, dict):
         if eps_this_year is None:
@@ -1424,9 +1429,9 @@ def get_growth_estimates_from_yfinance(ticker_obj):
     return pick_value(last_row), pick_value(this_row), pick_value(next_row)
 
 
-def get_eps_and_growth_data(ticker_obj):
+def get_eps_and_growth_data(ticker_obj, info=None):
     eps_last_year = get_annual_eps_from_financials(ticker_obj)
-    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
+    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj, info=info)
     _ignore_last, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
 
     return {
@@ -1438,8 +1443,8 @@ def get_eps_and_growth_data(ticker_obj):
     }
 
 
-def pull_yahoo_targets(symbol):
-    out = {
+def _empty_yahoo_row(symbol, error=None):
+    return {
         "Yahoo Ticker": symbol,
         "Current Price": None,
         "Target Low": None,
@@ -1456,8 +1461,12 @@ def pull_yahoo_targets(symbol):
         "Growth Last Year": None,
         "Growth This Year Est": None,
         "Growth Next Year Est": None,
-        "Yahoo Error": None,
+        "Yahoo Error": error,
     }
+
+
+def pull_yahoo_targets(symbol):
+    out = _empty_yahoo_row(symbol)
 
     try:
         t = yf.Ticker(symbol)
@@ -1509,7 +1518,8 @@ def pull_yahoo_targets(symbol):
         out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
 
         try:
-            out.update(get_eps_and_growth_data(t))
+            # Reuse the info payload above instead of fetching quoteSummary twice.
+            out.update(get_eps_and_growth_data(t, info=info))
         except Exception as e:
             out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
 
@@ -1524,37 +1534,89 @@ def pull_yahoo_targets(symbol):
     return out
 
 
-def add_yahoo_targets(holdings):
-    rows = []
-    symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
+def _pull_yahoo_targets_timed(symbol):
+    started = time.perf_counter()
+    try:
+        row = pull_yahoo_targets(symbol)
+    except Exception as e:
+        row = _empty_yahoo_row(symbol, f"unexpected Yahoo worker error: {e}")
+    elapsed = time.perf_counter() - started
+    YAHOO_FETCH_TIMINGS[symbol] = elapsed
+    return symbol, row, elapsed
 
-    for i, symbol in enumerate(symbols, 1):
+
+def add_yahoo_targets(holdings):
+    batch_started = time.perf_counter()
+    symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
+    result_by_symbol = {}
+    cached_count = 0
+    skipped_count = 0
+    to_fetch = []
+
+    for symbol in symbols:
         if symbol in YAHOO_TARGET_CACHE:
-            print(f"Yahoo targets cached {i}/{len(symbols)}: {symbol}")
-            rows.append(YAHOO_TARGET_CACHE[symbol].copy())
+            cached_count += 1
+            result_by_symbol[symbol] = YAHOO_TARGET_CACHE[symbol].copy()
             continue
 
-        print(f"Yahoo targets + PE + YTD + EPS + Growth {i}/{len(symbols)}: {symbol}")
-        row = pull_yahoo_targets(symbol)
-        YAHOO_TARGET_CACHE[symbol] = row.copy()
-        rows.append(row)
-        time.sleep(YAHOO_SLEEP_SECONDS)
+        if not is_plausible_yahoo_symbol(symbol):
+            skipped_count += 1
+            row = _empty_yahoo_row(symbol, "preflight skipped: implausible Yahoo equity symbol")
+            YAHOO_TARGET_CACHE[symbol] = row.copy()
+            result_by_symbol[symbol] = row
+            print(f"Yahoo preflight skipped: {symbol}")
+            continue
 
+        to_fetch.append(symbol)
+
+    if to_fetch:
+        workers = max(1, min(int(YAHOO_MAX_WORKERS), len(to_fetch)))
+        print(
+            f"Yahoo batch: fetching {len(to_fetch)} new symbol(s) with {workers} worker(s); "
+            f"{cached_count} cached, {skipped_count} preflight-skipped"
+        )
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="yahoo") as executor:
+            futures = {executor.submit(_pull_yahoo_targets_timed, symbol): symbol for symbol in to_fetch}
+            for completed, future in enumerate(as_completed(futures), 1):
+                symbol = futures[future]
+                try:
+                    _, row, elapsed = future.result()
+                except Exception as e:
+                    elapsed = 0.0
+                    row = _empty_yahoo_row(symbol, f"unexpected Yahoo future error: {e}")
+                YAHOO_TARGET_CACHE[symbol] = row.copy()
+                result_by_symbol[symbol] = row
+                print(f"Yahoo completed {completed}/{len(to_fetch)}: {symbol} ({elapsed:.2f}s)")
+
+    rows = [result_by_symbol[symbol] for symbol in symbols]
     targets = pd.DataFrame(rows)
     merged = holdings.merge(targets, on="Yahoo Ticker", how="left")
 
-    for c in NUMERIC_YAHOO_COLUMNS:
-        if c in merged.columns:
-            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+    for col in NUMERIC_YAHOO_COLUMNS:
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
-    if "Growth Last Year" in merged.columns:
+    # The per-symbol worker already makes multiple adjusted-history attempts. The
+    # old unconditional second pass could repeat the slowest failing Yahoo calls.
+    # Keep it available as a compatibility knob, but default it off in refactor-safe.
+    if YAHOO_RETRY_MISSING_GROWTH and "Growth Last Year" in merged.columns:
         missing = merged["Growth Last Year"].isna()
         if missing.any():
             for sym in merged.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
+                if not is_plausible_yahoo_symbol(sym):
+                    continue
                 val = get_last_calendar_year_stock_return_from_yahoo(sym)
                 if val is not None:
                     merged.loc[merged["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
 
+    elapsed = time.perf_counter() - batch_started
+    fetched_timings = [(s, YAHOO_FETCH_TIMINGS.get(s, 0.0)) for s in to_fetch]
+    slowest = sorted(fetched_timings, key=lambda x: x[1], reverse=True)[:5]
+    slow_text = ", ".join(f"{s}={secs:.1f}s" for s, secs in slowest) if slowest else "none"
+    print(
+        f"Yahoo batch complete: {len(symbols)} symbols in {elapsed:.2f}s "
+        f"(new={len(to_fetch)}, cached={cached_count}, skipped={skipped_count}); slowest: {slow_text}"
+    )
     return merged
 
 # CALCULATIONS
