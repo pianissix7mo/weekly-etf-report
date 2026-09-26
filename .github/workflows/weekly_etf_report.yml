@@ -28,7 +28,7 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run offline regression tests
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Run ETF analyst report with retry
         uses: nick-fields/retry@v3
