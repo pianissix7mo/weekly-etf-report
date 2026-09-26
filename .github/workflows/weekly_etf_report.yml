@@ -1,4 +1,4 @@
-name: ETF Analyst Report
+name: ETF Analyst Report - Legacy Main (No Email)
 
 on:
   workflow_dispatch:
@@ -37,16 +37,6 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 60
           command: python etf_analyst_report_complete.py
-
-      - name: Send ETF report email
-        env:
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: 465
-          SMTP_USER: pianissix7mo@gmail.com
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: pianissix7mo@gmail.com
-          EMAIL_TO: mofeiwang@hotmail.com,mofeiwang@yahoo.ca
-        run: python send_etf_report_email.py
 
       - name: Commit PE history and latest report
         run: |
