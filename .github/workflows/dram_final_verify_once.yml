@@ -1,0 +1,48 @@
+name: DRAM Final Verification Once
+
+on:
+  push:
+    branches:
+      - refactor-safe
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Run regression tests
+        run: python -m pytest -q
+      - name: Verify live DRAM source and valuation
+        run: |
+          python - <<'PY'
+          import etf_analyst_report_complete as p
+
+          holdings = p.pull_issuer_holdings("DRAM")
+          print("DRAM_ROWS=", len(holdings))
+          print("DRAM_WEIGHT=", round(float(holdings["Weight"].sum()), 4))
+          print(holdings[["Yahoo Ticker","Weight","Name"]].to_string(index=False))
+          assert len(holdings) >= 8
+          assert 90 <= holdings["Weight"].sum() <= 110
+          assert "MU" in set(holdings["Yahoo Ticker"])
+          assert "005930.KS" in set(holdings["Yahoo Ticker"])
+          assert "000660.KS" in set(holdings["Yahoo Ticker"])
+          assert "285A.T" in set(holdings["Yahoo Ticker"])
+
+          enriched = p.calculate_returns(p.add_yahoo_targets(holdings))
+          summary = p.summarize_etf(enriched, "DRAM")
+          p.print_summary(summary)
+          print("DRAM_FORWARD_PE=", summary.get("Forward PE"))
+          print("DRAM_PE=", summary.get("PE Ratio"))
+          print("DRAM_COVERED_WEIGHT=", summary.get("Covered Weight"))
+          PY
