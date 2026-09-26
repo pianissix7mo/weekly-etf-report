@@ -950,11 +950,13 @@ def pull_blackrock_ishares(etf):
     })
 
     urls = [
+        cfg.get("holdings_url"),
         f"https://www.ishares.com/us/products/{product_id}/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
         f"{product_page}/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
         f"{product_page}/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
         f"https://www.ishares.com/us/products/{product_id}/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
     ]
+    urls = [url for url in urls if url]
 
     errors = []
 
