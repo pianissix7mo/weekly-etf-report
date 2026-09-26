@@ -701,6 +701,52 @@ def pull_dram_roundhill_issuer_page():
     return pull_roundhill_issuer_page("DRAM")
 
 
+def standardize_dram_exposure_candidate(raw, source_name):
+    """Use Roundhill's company-level DRAM exposure rows, not raw stock/swap legs.
+
+    The DRAM page nests stock and total-return-swap legs beneath a company-level
+    exposure row. Counting both levels double-counts the same economic exposure.
+    Parent/company rows are the issuer's published combined exposure weights.
+    """
+    df = raw.copy().dropna(how="all")
+    df.columns = make_unique_columns(df.columns)
+
+    name_col = find_col(df, NAME_COLS, contains=["name", "company", "holding", "security"])
+    weight_col = find_weight_col_strict(df)
+    ticker_col = find_col(df, TICKER_COLS, contains=["ticker", "symbol"])
+
+    if name_col is None or weight_col is None:
+        raise SourceSchemaChangedError(
+            f"DRAM {source_name}: missing company-level Name/Weight columns. Columns={list(df.columns)}"
+        )
+
+    names = df[name_col].fillna("").astype(str).str.strip()
+    # On Roundhill's hierarchical table, child stock/swap legs have blank Name.
+    company_rows = df[names.ne("")].copy()
+    if company_rows.empty:
+        raise SourceSchemaChangedError(f"DRAM {source_name}: no company-level exposure rows")
+
+    # Exclude non-investment headings/totals if the page ever injects them.
+    company_names = company_rows[name_col].fillna("").astype(str)
+    company_rows = company_rows[
+        ~company_names.str.lower().str.contains(
+            r"^(total|cash|cash equivalents?|collateral|receivable|payable)$",
+            regex=True,
+            na=False,
+        )
+    ].copy()
+
+    test = normalize_holdings(company_rows, "DRAM")
+    total = test["Weight"].sum()
+
+    if len(test) < int(ETF_CONFIG["DRAM"].get("min_rows", 8)):
+        raise ValueError(f"DRAM {source_name}: only {len(test)} company exposure rows")
+    if total < 90 or total > 110:
+        raise ValueError(f"DRAM {source_name}: bad company exposure total {total:.2f}%")
+
+    return company_rows
+
+
 def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
     """
     Generic Roundhill holdings validator for MAGS/CHAT.
@@ -709,6 +755,9 @@ def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
     passing through normalize_holdings(), so we do not rely on hard-coded equal
     weights or fixed top-holding lists.
     """
+    if etf == "DRAM":
+        return standardize_dram_exposure_candidate(raw, source_name)
+
     test = normalize_holdings(raw, etf)
 
     if min_rows is None:
