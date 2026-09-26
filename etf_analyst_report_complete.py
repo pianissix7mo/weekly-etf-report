@@ -43,6 +43,7 @@ from etf_report.config import (
     HEADERS,
     ID_COLS,
     INCLUDE_CASH_FUTURES_SWAPS,
+    INVESCO_OFFICIAL_PAGE_URLS,
     NAME_COLS,
     OUTPUT_DIR,
     PLAYWRIGHT_TIMEOUT_SECONDS,
@@ -57,7 +58,7 @@ from etf_report.errors import (
     ReportIncompleteError,
     SourceSchemaChangedError,
 )
-from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_to_yahoo_symbol
+from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_name_to_yahoo, map_to_yahoo_symbol
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
