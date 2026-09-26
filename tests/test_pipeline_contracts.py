@@ -108,3 +108,9 @@ def test_main_exports_only_after_all_required_etfs_complete(monkeypatch):
     assert len(summaries) == 2
     assert failures == []
     assert calls == {"history": 1, "export": 1}
+
+
+def test_source_helpers_survive_module_split():
+    assert pipeline.INVESCO_OFFICIAL_PAGE_URLS["QQQ"].startswith("https://")
+    assert callable(pipeline.map_name_to_yahoo)
+    assert pipeline.map_name_to_yahoo("NVIDIA Corporation") == "NVDA"
