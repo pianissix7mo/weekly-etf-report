@@ -94,14 +94,12 @@ def is_plausible_yahoo_symbol(symbol):
             base = s[:-len(suffix)]
             return bool(base) and bool(re.fullmatch(r"[A-Z0-9-]+", base))
 
-    # Plain numeric/alphanumeric artifacts from Asian holdings feeds are not valid
-    # Yahoo US symbols unless the exchange suffix was mapped first.
-    if any(ch.isdigit() for ch in s):
-        return False
-
     # Money-market / mutual-fund cash sweep tickers commonly end in XX/XXX and do
     # not provide the stock analyst data this report consumes.
     if len(s) >= 5 and s.endswith("XX"):
         return False
 
-    return bool(re.fullmatch(r"[A-Z]{1,6}(?:-[A-Z])?", s))
+    # Keep bare numeric/alphanumeric symbols eligible. Some international issuer
+    # feeds omit exchange suffixes; rejecting them here could reduce coverage.
+    # Concurrency makes an occasional Yahoo miss cheap enough to preserve behavior.
+    return bool(re.fullmatch(r"[A-Z0-9]{1,6}(?:-[A-Z0-9])?", s))
