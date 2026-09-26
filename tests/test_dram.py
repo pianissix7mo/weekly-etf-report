@@ -82,7 +82,10 @@ def test_dram_rejects_double_counted_company_exposure_above_expected_range():
         pipeline.standardize_roundhill_candidate(raw, "DRAM", "double-counted fixture")
 
     assert pipeline.ETF_CONFIG["DRAM"]["max_total_weight"] == 110
-    assert "company-level exposure" in pipeline.ETF_CONFIG["DRAM"]["weight_basis"]
+    basis = pipeline.ETF_CONFIG["DRAM"]["weight_basis"].lower()
+    assert "combined" in basis
+    assert "stock" in basis
+    assert "total return swaps" in basis
 
 
 def test_dram_rejects_implausible_company_exposure():
