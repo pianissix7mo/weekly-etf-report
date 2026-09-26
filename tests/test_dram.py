@@ -33,6 +33,7 @@ def test_dram_is_required_and_uses_roundhill_config():
     assert cfg["issuer"] == "Roundhill live holdings"
     assert cfg["url"].endswith("/etf/dram/")
     assert cfg["min_rows"] == 8
+    assert "combined company exposure" in cfg["weight_basis"]
 
 
 def test_dram_roundhill_candidate_accepts_focused_memory_basket():
