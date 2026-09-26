@@ -24,8 +24,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests yfinance beautifulsoup4 XlsxWriter openpyxl lxml html5lib pypdf playwright
+          pip install -r requirements.txt
           python -m playwright install --with-deps chromium
+
+      - name: Run offline regression tests
+        run: pytest -q
 
       - name: Run ETF analyst report with retry
         uses: nick-fields/retry@v3
