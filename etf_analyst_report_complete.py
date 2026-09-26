@@ -697,6 +697,10 @@ def pull_chat_roundhill_issuer_page():
     return pull_roundhill_issuer_page("CHAT")
 
 
+def pull_dram_roundhill_issuer_page():
+    return pull_roundhill_issuer_page("DRAM")
+
+
 def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
     """
     Generic Roundhill holdings validator for MAGS/CHAT.
@@ -708,7 +712,7 @@ def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
     test = normalize_holdings(raw, etf)
 
     if min_rows is None:
-        min_rows = 7 if etf == "MAGS" else 20
+        min_rows = int(ETF_CONFIG.get(etf, {}).get("min_rows", 7 if etf == "MAGS" else 20))
 
     if len(test) < min_rows:
         raise ValueError(f"{etf} {source_name}: only {len(test)} rows")
@@ -722,7 +726,7 @@ def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
 
 def pull_roundhill_issuer_page(etf):
     """
-    Pull Roundhill ETF holdings, currently used for MAGS and CHAT.
+    Pull Roundhill ETF holdings, currently used for MAGS, CHAT, and DRAM.
 
     Order of attempts:
       1. Static HTML tables from the issuer page.
@@ -1058,6 +1062,7 @@ def pull_issuer_holdings(etf):
     elif etf == "QQQ": raw = pull_qqq_invesco_browser()
     elif etf == "MAGS": raw = pull_mags_roundhill_issuer_page()
     elif etf == "CHAT": raw = pull_chat_roundhill_issuer_page()
+    elif etf == "DRAM": raw = pull_dram_roundhill_issuer_page()
     elif etf == "TECH.TO": raw = pull_evolve_tech_csv()
     elif etf == "CHPS.TO": raw = pull_globalx_chps_page()
     elif etf == "SOXX": raw = pull_blackrock_soxx()
@@ -1067,7 +1072,7 @@ def pull_issuer_holdings(etf):
     else: raise ValueError(f"No ETF config found for {etf}")
     holdings = normalize_holdings(raw, etf)
     if etf == "MAGS": sanity_check_weight_total(holdings, etf, low=90, high=120)
-    elif etf == "CHAT": sanity_check_weight_total(holdings, etf, low=85, high=115)
+    elif etf in ["CHAT", "DRAM"]: sanity_check_weight_total(holdings, etf, low=85, high=115)
     elif etf == "SMH": sanity_check_weight_total(holdings, etf, low=90, high=105)
     elif etf in ["SOXX", "OEF"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
     elif etf in ["SPMO", "QQQ"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
