@@ -1,6 +1,6 @@
 from pathlib import Path
 
-ETFS = ["SPMO", "OEF", "MAGS", "CHAT", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
+ETFS = ["SPMO", "OEF", "MAGS", "CHAT", "DRAM", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
 OUTPUT_DIR = Path("etf_analyst_target_outputs")
 
 YAHOO_SLEEP_SECONDS = 0.25
@@ -32,11 +32,19 @@ ETF_CONFIG = {
         "issuer": "Roundhill live holdings",
         "url": "https://www.roundhillinvestments.com/etf/mags/",
         "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/MAGS_Factsheet.pdf",
+        "min_rows": 7,
     },
     "CHAT": {
         "issuer": "Roundhill live holdings",
         "url": "https://www.roundhillinvestments.com/etf/chat/",
         "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/CHAT_Factsheet.pdf",
+        "min_rows": 20,
+    },
+    "DRAM": {
+        "issuer": "Roundhill live holdings",
+        "url": "https://www.roundhillinvestments.com/etf/dram/",
+        "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/DRAM_Factsheet.pdf",
+        "min_rows": 8,
     },
     "TECH.TO": {
         "issuer": "Evolve ETFs",
