@@ -47,7 +47,7 @@ ETF_CONFIG = {
         "min_rows": 8,
         "min_total_weight": 90,
         "max_total_weight": 110,
-        "weight_basis": "company-level exposure combining stock positions and total return swaps",
+        "weight_basis": "combined company exposure from stock positions and total return swaps",
     },
     "TECH.TO": {
         "issuer": "Evolve ETFs",
