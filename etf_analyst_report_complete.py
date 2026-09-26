@@ -1866,8 +1866,13 @@ def _write_number_or_dash(ws, row, col, val, num_fmt, dash_fmt):
 
 
 def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_history, chart_start_row, start_col=1):
+    title_fmt = workbook.add_format({"bold": True, "font_size": 12})
+
     if pe_history is None or pe_history.empty:
         worksheet.write(chart_start_row, start_col, "PE history charts will appear after more runs are saved.")
+        forward_ws = workbook.add_worksheet("Forward PE")
+        writer.sheets["Forward PE"] = forward_ws
+        forward_ws.write(0, 0, "Forward PE history charts will appear after more runs are saved.")
         return
 
     hist = pe_history.copy()
@@ -1887,8 +1892,8 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
     data_ws.hide()
 
     headers = ["Date", "ETF", "PE Ratio", "Forward PE", "PE coverage", "Forward PE coverage", "YTD", "Covered Weight"]
-    for c, h in enumerate(headers):
-        data_ws.write(0, c, h)
+    for col, header in enumerate(headers):
+        data_ws.write(0, col, header)
 
     date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd"})
     num_fmt = workbook.add_format({"num_format": "0.00"})
@@ -1904,38 +1909,58 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
         _write_number_or_dash(data_ws, r, 6, row.get("YTD"), pct_fmt, pct_fmt)
         _write_number_or_dash(data_ws, r, 7, row.get("Covered Weight"), pct_fmt, pct_fmt)
 
-    worksheet.write(chart_start_row, start_col, "PE history, last 1 year", workbook.add_format({"bold": True, "font_size": 12}))
+    worksheet.write(chart_start_row, start_col, "Current PE history, last 1 year", title_fmt)
 
-    for i, etf in enumerate(hist_1y["ETF"].dropna().astype(str).unique()):
-        chart_row = chart_start_row + 2 + (i // 2) * 16
-        chart_col = start_col + (i % 2) * 8
-        seq_positions = [j + 1 for j, (_, row) in enumerate(hist_1y.iterrows()) if str(row.get("ETF")) == etf]
+    forward_ws = workbook.add_worksheet("Forward PE")
+    writer.sheets["Forward PE"] = forward_ws
+    forward_ws.write(0, 0, "Forward PE history, last 1 year", title_fmt)
+    forward_ws.set_column("A:P", 12)
 
+    etfs = hist_1y["ETF"].dropna().astype(str).unique()
+    for i, etf in enumerate(etfs):
+        summary_chart_row = chart_start_row + 2 + (i // 2) * 16
+        summary_chart_col = start_col + (i % 2) * 8
+        forward_chart_row = 2 + (i // 2) * 16
+        forward_chart_col = (i % 2) * 8
+
+        seq_positions = [
+            j + 1
+            for j, (_, row) in enumerate(hist_1y.iterrows())
+            if str(row.get("ETF")) == etf
+        ]
         if not seq_positions:
             continue
 
         first_row = min(seq_positions)
         last_row = max(seq_positions)
 
-        chart = workbook.add_chart({"type": "line"})
-        chart.add_series({
+        current_chart = workbook.add_chart({"type": "line"})
+        current_chart.add_series({
             "name": f"{etf} Current PE",
             "categories": [data_sheet_name, first_row, 0, last_row, 0],
             "values": [data_sheet_name, first_row, 2, last_row, 2],
             "marker": {"type": "circle", "size": 4},
         })
-        chart.add_series({
+        current_chart.set_title({"name": f"{etf} Current PE"})
+        current_chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
+        current_chart.set_y_axis({"name": "PE", "major_gridlines": {"visible": True}})
+        current_chart.set_legend({"none": True})
+        current_chart.set_size({"width": 520, "height": 300})
+        worksheet.insert_chart(summary_chart_row, summary_chart_col, current_chart)
+
+        forward_chart = workbook.add_chart({"type": "line"})
+        forward_chart.add_series({
             "name": f"{etf} Forward PE",
             "categories": [data_sheet_name, first_row, 0, last_row, 0],
             "values": [data_sheet_name, first_row, 3, last_row, 3],
             "marker": {"type": "diamond", "size": 4},
         })
-        chart.set_title({"name": f"{etf} PE vs Forward PE"})
-        chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
-        chart.set_y_axis({"name": "PE", "major_gridlines": {"visible": True}})
-        chart.set_legend({"position": "bottom"})
-        chart.set_size({"width": 520, "height": 300})
-        worksheet.insert_chart(chart_row, chart_col, chart)
+        forward_chart.set_title({"name": f"{etf} Forward PE"})
+        forward_chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
+        forward_chart.set_y_axis({"name": "Forward PE", "major_gridlines": {"visible": True}})
+        forward_chart.set_legend({"none": True})
+        forward_chart.set_size({"width": 520, "height": 300})
+        forward_ws.insert_chart(forward_chart_row, forward_chart_col, forward_chart)
 
 
 def _make_edge_formats(workbook):
