@@ -1,13 +1,10 @@
-name: ETF Analyst Report
+name: ETF Analyst Report - Refactor Sandbox
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "15 16 * * 1-5"
-      timezone: "America/Toronto"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run-report:
@@ -38,31 +35,10 @@ jobs:
           retry_wait_seconds: 60
           command: python etf_analyst_report_complete.py
 
-      - name: Send ETF report email
-        env:
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: 465
-          SMTP_USER: pianissix7mo@gmail.com
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: pianissix7mo@gmail.com
-          EMAIL_TO: mofeiwang@hotmail.com,mofeiwang@yahoo.ca
-        run: python send_etf_report_email.py
-
-      - name: Commit PE history and latest report
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          git add etf_analyst_target_outputs/ETF_PE_history.xlsx
-
-          git commit -m "Update ETF PE history and report" || echo "No report changes to commit"
-          git pull --rebase origin "${GITHUB_REF_NAME}" || true
-          git push
-
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ETF-analyst-report
+          name: ETF-analyst-report-refactor-sandbox
           path: |
             etf_analyst_target_outputs/ETF_analyst_report.xlsx
             etf_analyst_target_outputs/ETF_PE_history.xlsx
