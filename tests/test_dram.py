@@ -52,7 +52,7 @@ def test_dram_roundhill_candidate_accepts_focused_memory_basket():
 
 def test_dram_roundhill_candidate_rejects_incomplete_basket():
     raw = _dram_fixture().iloc[:7].copy()
-    with pytest.raises(ValueError, match="only 7 rows"):
+    with pytest.raises(ValueError, match="only 7 company exposure rows"):
         pipeline.standardize_roundhill_candidate(raw, "DRAM", "fixture")
 
 
@@ -72,24 +72,23 @@ def test_dram_dispatch_uses_roundhill_adapter(monkeypatch):
     assert holdings["Weight"].sum() == pytest.approx(100.0)
 
 
-def test_dram_preserves_gross_exposure_above_100_percent():
+def test_dram_rejects_double_counted_company_exposure_above_expected_range():
     raw = _dram_fixture().copy()
     scale = 115.05 / raw["Weight"].sum()
     raw["Weight"] = raw["Weight"] * scale
 
-    validated = pipeline.standardize_roundhill_candidate(raw, "DRAM", "gross exposure fixture")
-    normalized = pipeline.normalize_holdings(validated, "DRAM")
+    with pytest.raises(ValueError, match="bad company exposure total"):
+        pipeline.standardize_roundhill_candidate(raw, "DRAM", "double-counted fixture")
 
-    assert normalized["Weight"].sum() == pytest.approx(115.05, abs=0.01)
-    assert pipeline.ETF_CONFIG["DRAM"]["max_total_weight"] == 130
-    assert "gross exposure" in pipeline.ETF_CONFIG["DRAM"]["weight_basis"]
+    assert pipeline.ETF_CONFIG["DRAM"]["max_total_weight"] == 110
+    assert "company-level exposure" in pipeline.ETF_CONFIG["DRAM"]["weight_basis"]
 
 
-def test_dram_rejects_implausible_gross_exposure():
+def test_dram_rejects_implausible_company_exposure():
     raw = _dram_fixture().copy()
     raw["Weight"] = raw["Weight"] * 1.40
-    with pytest.raises(ValueError, match="bad total"):
-        pipeline.standardize_roundhill_candidate(raw, "DRAM", "too leveraged fixture")
+    with pytest.raises(ValueError, match="bad company exposure total"):
+        pipeline.standardize_roundhill_candidate(raw, "DRAM", "too high fixture")
 
 
 def test_dram_hierarchical_table_uses_company_exposure_rows_only():
