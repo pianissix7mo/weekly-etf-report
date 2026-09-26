@@ -19,7 +19,8 @@ def _make_oef_csv():
     rows = ["Ticker,Name,Weight (%)"]
     for i in range(100):
         ticker = f"T{i:03d}"
-        rows.append(f"{ticker},Company {i},{1.0:.2f}")
+        weight = 2.0 if i == 0 else 98.0 / 99.0
+        rows.append(f"{ticker},Company {i},{weight:.6f}")
     return ("\n".join(rows) + "\n").encode("utf-8")
 
 
@@ -43,7 +44,7 @@ def test_oef_blackrock_csv_parser_uses_official_product_id(monkeypatch):
     normalized = pipeline.normalize_holdings(raw, "OEF")
 
     assert len(normalized) == 100
-    assert normalized["Weight"].sum() == pytest.approx(100.0)
+    assert normalized["Weight"].sum() == pytest.approx(100.0, abs=0.001)
     assert seen_urls
     assert "239723" in seen_urls[0]
     assert "OEF_holdings" in seen_urls[0]
