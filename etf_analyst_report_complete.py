@@ -1686,6 +1686,63 @@ def add_yahoo_targets(holdings):
     )
     return merged
 
+
+def validate_yahoo_data_quality(df, summary, etf):
+    """Fail closed when Yahoo coverage collapses enough to make the report misleading."""
+    if df is None or df.empty:
+        raise ReportIncompleteError(f"{etf}: Yahoo enrichment returned no rows.")
+
+    if "Weight Decimal" not in df.columns:
+        raise ReportIncompleteError(f"{etf}: Yahoo quality check is missing portfolio weights.")
+
+    weights = pd.to_numeric(df["Weight Decimal"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    total_weight = float(weights.sum())
+    if total_weight <= 0:
+        raise ReportIncompleteError(f"{etf}: Yahoo quality check found zero usable portfolio weight.")
+
+    if "Current Price" in df.columns:
+        prices = pd.to_numeric(df["Current Price"], errors="coerce")
+    else:
+        prices = pd.Series(np.nan, index=df.index, dtype=float)
+
+    price_coverage = float(weights[prices.notna()].sum() / total_weight)
+
+    covered_weight = safe_float_value(summary.get("Covered Weight")) or 0.0
+    pe_weight = safe_float_value(summary.get("PE Coverage Weight")) or 0.0
+    forward_pe_weight = safe_float_value(summary.get("Forward PE Coverage Weight")) or 0.0
+
+    target_coverage = float(covered_weight / total_weight)
+    pe_coverage = float(pe_weight / total_weight)
+    forward_pe_coverage = float(forward_pe_weight / total_weight)
+
+    failures = []
+    if price_coverage < 0.50:
+        failures.append(f"price coverage {price_coverage:.1%} < 50%")
+    if target_coverage < 0.05:
+        failures.append(f"analyst-target coverage {target_coverage:.1%} < 5%")
+    if max(pe_coverage, forward_pe_coverage) < 0.01:
+        failures.append(
+            f"PE coverage collapsed (trailing {pe_coverage:.1%}, forward {forward_pe_coverage:.1%})"
+        )
+
+    if failures:
+        error_rows = 0
+        if "Yahoo Error" in df.columns:
+            error_rows = int(df["Yahoo Error"].notna().sum())
+        raise ReportIncompleteError(
+            f"{etf}: Yahoo data quality check failed: "
+            + "; ".join(failures)
+            + f". Yahoo-error rows={error_rows}/{len(df)}. "
+            + "Refusing to write history or export/send a misleading report."
+        )
+
+    print(
+        f"{etf}: Yahoo quality OK — price={price_coverage:.1%}, "
+        f"targets={target_coverage:.1%}, PE={pe_coverage:.1%}, "
+        f"forward PE={forward_pe_coverage:.1%}"
+    )
+
+
 # CALCULATIONS
 # ============================================================
 
@@ -1884,16 +1941,11 @@ def build_excel_summary_rows(summary_df):
 def prepare_detail_sheet(details):
     df = details.copy()
 
+    # Export must be a pure formatting step. Yahoo data was already fetched in
+    # add_yahoo_targets(); retrying missing values here caused serial duplicate
+    # network calls every time detail/overlap sheets were built.
     if "Growth Last Year" not in df.columns:
         df["Growth Last Year"] = np.nan
-
-    if "Yahoo Ticker" in df.columns:
-        missing = df["Growth Last Year"].isna()
-        if missing.any():
-            for sym in df.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
-                val = get_last_calendar_year_stock_return_from_yahoo(sym)
-                if val is not None:
-                    df.loc[df["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
 
     out = pd.DataFrame()
     out["Ticker"] = df["Yahoo Ticker"]
@@ -2976,6 +3028,7 @@ def run_one_etf(etf):
 
     summary_started = time.perf_counter()
     summary = summarize_etf(enriched, etf)
+    validate_yahoo_data_quality(enriched, summary, etf)
     summary_seconds = time.perf_counter() - summary_started
     print_summary(summary)
 
