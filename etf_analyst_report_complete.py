@@ -1088,6 +1088,7 @@ NUMERIC_YAHOO_COLUMNS = [
 # This avoids asking Yahoo for AAPL/MSFT/NVDA/etc. again for every ETF tab.
 YAHOO_TARGET_CACHE = {}
 YAHOO_FETCH_TIMINGS = {}
+PIPELINE_TIMINGS = {}
 
 
 def get_ytd_return_from_yahoo(symbol):
@@ -2603,10 +2604,31 @@ def run_one_etf(etf):
     if etf.upper() == "CHPS":
         etf = "CHPS.TO"
 
+    total_started = time.perf_counter()
+
+    source_started = time.perf_counter()
     holdings = pull_issuer_holdings(etf)
+    source_seconds = time.perf_counter() - source_started
+
+    yahoo_started = time.perf_counter()
     enriched = calculate_returns(add_yahoo_targets(holdings))
+    yahoo_seconds = time.perf_counter() - yahoo_started
+
+    summary_started = time.perf_counter()
     summary = summarize_etf(enriched, etf)
+    summary_seconds = time.perf_counter() - summary_started
     print_summary(summary)
+
+    PIPELINE_TIMINGS[etf] = {
+        "source_seconds": source_seconds,
+        "yahoo_seconds": yahoo_seconds,
+        "summary_seconds": summary_seconds,
+        "total_seconds": time.perf_counter() - total_started,
+    }
+    print(
+        f"TIMING {etf}: source={source_seconds:.2f}s, yahoo={yahoo_seconds:.2f}s, "
+        f"summary={summary_seconds:.2f}s, total={PIPELINE_TIMINGS[etf]['total_seconds']:.2f}s"
+    )
 
     output_cols = [
         "ETF", "Yahoo Ticker", "Raw Ticker", "Name", "Weight", "Weight Decimal",
@@ -2625,6 +2647,7 @@ def run_one_etf(etf):
 
 
 def main_with_excel():
+    pipeline_started = time.perf_counter()
     print(f"ETF analyst report version: {REPORT_VERSION}")
 
     all_details = []
@@ -2663,8 +2686,27 @@ def main_with_excel():
             "Missing or failed ETF(s): " + ", ".join(missing_required or [f["ETF"] for f in failures])
         )
 
+    report_started = time.perf_counter()
     pe_history = update_pe_history(summaries)
     export_excel_report(all_details, summaries, pe_history=pe_history)
+    report_seconds = time.perf_counter() - report_started
+
+    total_seconds = time.perf_counter() - pipeline_started
+    print("\n" + "=" * 72)
+    print("PIPELINE TIMING SUMMARY")
+    print("=" * 72)
+    for etf in ETFS:
+        timing = PIPELINE_TIMINGS.get(etf)
+        if timing:
+            print(
+                f"{etf}: source={timing['source_seconds']:.2f}s, "
+                f"yahoo={timing['yahoo_seconds']:.2f}s, total={timing['total_seconds']:.2f}s"
+            )
+    if YAHOO_FETCH_TIMINGS:
+        slowest = sorted(YAHOO_FETCH_TIMINGS.items(), key=lambda x: x[1], reverse=True)[:10]
+        print("Slowest Yahoo symbols: " + ", ".join(f"{s}={secs:.1f}s" for s, secs in slowest))
+    print(f"Excel/history export: {report_seconds:.2f}s")
+    print(f"TOTAL PIPELINE: {total_seconds:.2f}s")
 
     return all_details, summaries, failures
 
