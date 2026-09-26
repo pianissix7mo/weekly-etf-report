@@ -52,6 +52,9 @@ jobs:
           EMAIL_TO: mofeiwang@hotmail.com,mofeiwang@yahoo.ca
         run: python send_etf_report_email.py
 
+      - name: Preserve generated PE history
+        run: cp etf_analyst_target_outputs/ETF_PE_history.xlsx /tmp/ETF_PE_history.xlsx
+
       - name: Commit refactor-safe PE history
         run: |
           git config user.name "github-actions"
@@ -70,3 +73,13 @@ jobs:
             etf_analyst_target_outputs/ETF_PE_history.xlsx
             etf_analyst_target_outputs/ETF_analyst_report_*.xlsx
           retention-days: 30
+
+      - name: Mirror PE history to main
+        run: |
+          git fetch origin main
+          git checkout main
+          git pull --rebase origin main || true
+          cp /tmp/ETF_PE_history.xlsx etf_analyst_target_outputs/ETF_PE_history.xlsx
+          git add etf_analyst_target_outputs/ETF_PE_history.xlsx
+          git commit -m "Mirror refactor-safe ETF PE history to main" || echo "No main PE history changes to commit"
+          git push origin HEAD:main
