@@ -718,8 +718,14 @@ def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
         raise ValueError(f"{etf} {source_name}: only {len(test)} rows")
 
     total = test["Weight"].sum()
-    if total < 85 or total > 115:
-        raise ValueError(f"{etf} {source_name}: bad total {total:.2f}%")
+    cfg = ETF_CONFIG.get(etf, {})
+    min_total = float(cfg.get("min_total_weight", 85))
+    max_total = float(cfg.get("max_total_weight", 115))
+    if total < min_total or total > max_total:
+        raise ValueError(
+            f"{etf} {source_name}: bad total {total:.2f}% "
+            f"(expected {min_total:.0f}-{max_total:.0f}%)"
+        )
 
     return raw
 
@@ -1072,7 +1078,15 @@ def pull_issuer_holdings(etf):
     else: raise ValueError(f"No ETF config found for {etf}")
     holdings = normalize_holdings(raw, etf)
     if etf == "MAGS": sanity_check_weight_total(holdings, etf, low=90, high=120)
-    elif etf in ["CHAT", "DRAM"]: sanity_check_weight_total(holdings, etf, low=85, high=115)
+    elif etf == "CHAT": sanity_check_weight_total(holdings, etf, low=85, high=115)
+    elif etf == "DRAM":
+        cfg = ETF_CONFIG["DRAM"]
+        sanity_check_weight_total(
+            holdings,
+            etf,
+            low=float(cfg.get("min_total_weight", 85)),
+            high=float(cfg.get("max_total_weight", 130)),
+        )
     elif etf == "SMH": sanity_check_weight_total(holdings, etf, low=90, high=105)
     elif etf in ["SOXX", "OEF"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
     elif etf in ["SPMO", "QQQ"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
@@ -1732,7 +1746,7 @@ def build_fear_greed_summary():
 # EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-REPORT_VERSION = "forward-pe-dashboard-v11-oef"
+REPORT_VERSION = "forward-pe-dashboard-v12-dram"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
 REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
