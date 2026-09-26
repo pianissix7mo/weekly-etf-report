@@ -50,14 +50,16 @@ ETF_CONFIG = {
         "issuer": "iShares / BlackRock",
         "product_id": "239705",
         "file_name": "SOXX_holdings",
-        "page_url": "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf",
+        "page_url": "https://www.ishares.com/us/products/239705/ishares-semiconductor-etf",
+        "holdings_url": "https://www.ishares.com/us/products/239705/ishares-semiconductor-etf/latest-holdings.csv",
         "min_rows": 20,
     },
     "OEF": {
         "issuer": "iShares / BlackRock",
         "product_id": "239723",
         "file_name": "OEF_holdings",
-        "page_url": "https://www.ishares.com/us/products/239723/ishares-sp-100-etf",
+        "page_url": "https://www.ishares.com/us/products/239723/ishares-s-p-100-etf",
+        "holdings_url": "https://www.ishares.com/us/products/239723/ishares-s-p-100-etf/latest-holdings.csv",
         "min_rows": 90,
     },
     "SMH": {
