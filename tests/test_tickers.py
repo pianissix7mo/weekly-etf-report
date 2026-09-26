@@ -1,6 +1,6 @@
 import pytest
 
-from etf_report.tickers import looks_like_bad_row, map_to_yahoo_symbol
+from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_to_yahoo_symbol
 
 
 @pytest.mark.parametrize(
@@ -30,3 +30,23 @@ def test_cash_like_rows_are_rejected():
 
 def test_empty_ticker_returns_none():
     assert map_to_yahoo_symbol("", "", "") is None
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        ("AAPL", True),
+        ("BRK-B", True),
+        ("005930.KS", True),
+        ("2330.TW", True),
+        ("SHOP.TO", True),
+        ("ARM$CBRS", False),
+        ("IXTZ6", False),
+        ("285A", False),
+        ("AGPXX", False),
+        ("FGXXX", False),
+        ("", False),
+    ],
+)
+def test_yahoo_symbol_preflight(symbol, expected):
+    assert is_plausible_yahoo_symbol(symbol) is expected
