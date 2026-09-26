@@ -42,16 +42,6 @@ jobs:
           retry_wait_seconds: 60
           command: python etf_analyst_report_complete.py
 
-      - name: Send ETF report email
-        env:
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: 465
-          SMTP_USER: pianissix7mo@gmail.com
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: pianissix7mo@gmail.com
-          EMAIL_TO: mofeiwang@hotmail.com,mofeiwang@yahoo.ca
-        run: python send_etf_report_email.py
-
       - name: Preserve generated PE history
         run: cp etf_analyst_target_outputs/ETF_PE_history.xlsx /tmp/ETF_PE_history.xlsx
 
@@ -64,6 +54,17 @@ jobs:
           git pull --rebase origin refactor-safe || true
           git push origin HEAD:refactor-safe
 
+      - name: Mirror PE history to main
+        run: |
+          git fetch origin main
+          git checkout main
+          git pull --rebase origin main || true
+          cp /tmp/ETF_PE_history.xlsx etf_analyst_target_outputs/ETF_PE_history.xlsx
+          git add etf_analyst_target_outputs/ETF_PE_history.xlsx
+          git commit -m "Mirror refactor-safe ETF PE history to main" || echo "No main PE history changes to commit"
+          git push origin HEAD:main
+          git checkout refactor-safe
+
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
@@ -74,12 +75,12 @@ jobs:
             etf_analyst_target_outputs/ETF_analyst_report_*.xlsx
           retention-days: 30
 
-      - name: Mirror PE history to main
-        run: |
-          git fetch origin main
-          git checkout main
-          git pull --rebase origin main || true
-          cp /tmp/ETF_PE_history.xlsx etf_analyst_target_outputs/ETF_PE_history.xlsx
-          git add etf_analyst_target_outputs/ETF_PE_history.xlsx
-          git commit -m "Mirror refactor-safe ETF PE history to main" || echo "No main PE history changes to commit"
-          git push origin HEAD:main
+      - name: Send ETF report email
+        env:
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: 465
+          SMTP_USER: pianissix7mo@gmail.com
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: pianissix7mo@gmail.com
+          EMAIL_TO: mofeiwang@hotmail.com,mofeiwang@yahoo.ca
+        run: python send_etf_report_email.py
