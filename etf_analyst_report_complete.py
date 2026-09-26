@@ -930,33 +930,29 @@ def pull_globalx_chps_page():
     return pd.DataFrame(rows)
 
 
-def pull_blackrock_soxx():
+def pull_blackrock_ishares(etf):
+    """Pull holdings for an iShares/BlackRock ETF using the official CSV endpoint.
+
+    The direct CSV path is preferred. A rendered product-page fallback is retained
+    because BlackRock occasionally changes the download route or response format.
     """
-    Pull SOXX holdings from BlackRock/iShares.
+    etf = etf.upper()
+    cfg = ETF_CONFIG[etf]
+    product_id = cfg["product_id"]
+    file_name = cfg["file_name"]
+    product_page = cfg["page_url"]
+    min_rows = int(cfg.get("min_rows", 20))
 
-    Fix:
-      BlackRock's current holdings download URL uses:
-        /us/products/239705/fund/1467271812596.ajax?...
-      The older URL without /fund/ can return no usable holdings, which caused SOXX
-      to fail and then disappear from the final emailed workbook.
-    """
-    product_id = ETF_CONFIG["SOXX"]["product_id"]
-    file_name = ETF_CONFIG["SOXX"]["file_name"]
-
-    product_page = f"https://www.ishares.com/us/products/{product_id}/ishares-phlx-semiconductor-etf"
-
-    soxx_headers = dict(HEADERS)
-    soxx_headers.update({
+    headers = dict(HEADERS)
+    headers.update({
         "Accept": "text/csv,application/csv,application/vnd.ms-excel,application/octet-stream,*/*",
         "Referer": product_page,
     })
 
-    # Put the current official BlackRock download endpoint first.
-    # Keep older endpoint shapes as fallbacks in case BlackRock changes routing again.
     urls = [
         f"https://www.ishares.com/us/products/{product_id}/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
-        f"https://www.ishares.com/us/products/{product_id}/ishares-phlx-semiconductor-etf/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
-        f"https://www.ishares.com/us/products/{product_id}/ishares-phlx-semiconductor-etf/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
+        f"{product_page}/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
+        f"{product_page}/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
         f"https://www.ishares.com/us/products/{product_id}/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
     ]
 
@@ -964,7 +960,7 @@ def pull_blackrock_soxx():
 
     for url in urls:
         try:
-            r = requests.get(url, headers=soxx_headers, timeout=60)
+            r = requests.get(url, headers=headers, timeout=60)
 
             if r.status_code != 200 or len(r.content) < 200:
                 errors.append(f"{url}: status={r.status_code}, bytes={len(r.content)}")
@@ -977,58 +973,56 @@ def pull_blackrock_soxx():
                 continue
 
             table = choose_best_holdings_table(dfs)
-
-            # Validate before returning so a disclaimer/summary table cannot pass through.
-            test = normalize_holdings(table, "SOXX")
+            test = normalize_holdings(table, etf)
             n = len(test)
             total = test["Weight"].sum()
 
-            # SOXX is currently a concentrated semiconductor ETF with about 30 holdings.
-            # Use a tolerant range because cash/derivative rows can be excluded.
-            if n < 20 or not (85 <= total <= 110):
-                errors.append(f"{url}: parsed table failed sanity check. rows={n}, total_weight={total:.2f}%")
+            if n < min_rows or not (85 <= total <= 110):
+                errors.append(
+                    f"{url}: parsed table failed sanity check. "
+                    f"rows={n}, total_weight={total:.2f}%"
+                )
                 continue
 
-            print(f"SOXX holdings source used: {url}")
-            print(f"SOXX validation rows={n}, total_weight={total:.2f}%")
+            print(f"{etf} holdings source used: {url}")
+            print(f"{etf} validation rows={n}, total_weight={total:.2f}%")
             return table
 
         except Exception as e:
             errors.append(f"{url}: {repr(e)}")
 
-    # Last resort: render the official page and try to parse/download via Playwright.
     try:
         art = fetch_rendered_artifacts(
             product_page,
             click_texts=["Holdings", "All", "Detailed Holdings and Analytics"],
-            download_texts=["Detailed Holdings and Analytics", "Data Download", "Download"],
+            download_texts=["Detailed Holdings and Analytics", "Data Download", "Download Holdings CSV", "Download"],
             wait_seconds=8,
         )
 
         if art.get("download_bytes"):
             dfs = read_any_file_to_tables(art["download_bytes"])
             table = choose_best_holdings_table(dfs)
-            test = normalize_holdings(table, "SOXX")
+            test = normalize_holdings(table, etf)
             n = len(test)
             total = test["Weight"].sum()
-            if n >= 20 and 85 <= total <= 110:
-                print("SOXX holdings source used: rendered iShares download")
-                print(f"SOXX validation rows={n}, total_weight={total:.2f}%")
+            if n >= min_rows and 85 <= total <= 110:
+                print(f"{etf} holdings source used: rendered iShares download")
+                print(f"{etf} validation rows={n}, total_weight={total:.2f}%")
                 return table
             errors.append(f"rendered download sanity failed: rows={n}, total_weight={total:.2f}%")
 
         try:
             table = try_tables_from_html_for_candidate(
                 art.get("html", ""),
-                "SOXX",
+                etf,
                 lambda raw, source_name: raw,
             )
-            test = normalize_holdings(table, "SOXX")
+            test = normalize_holdings(table, etf)
             n = len(test)
             total = test["Weight"].sum()
-            if n >= 20 and 85 <= total <= 110:
-                print("SOXX holdings source used: rendered iShares HTML")
-                print(f"SOXX validation rows={n}, total_weight={total:.2f}%")
+            if n >= min_rows and 85 <= total <= 110:
+                print(f"{etf} holdings source used: rendered iShares HTML")
+                print(f"{etf} validation rows={n}, total_weight={total:.2f}%")
                 return table
             errors.append(f"rendered HTML sanity failed: rows={n}, total_weight={total:.2f}%")
         except Exception as e:
@@ -1037,8 +1031,15 @@ def pull_blackrock_soxx():
     except Exception as e:
         errors.append(f"rendered page fallback failed: {repr(e)}")
 
-    raise ValueError("SOXX BlackRock holdings could not be parsed. Attempts:\n - " + "\n - ".join(errors))
+    raise ValueError(f"{etf} BlackRock holdings could not be parsed. Attempts:\n - " + "\n - ".join(errors))
 
+
+def pull_blackrock_soxx():
+    return pull_blackrock_ishares("SOXX")
+
+
+def pull_blackrock_oef():
+    return pull_blackrock_ishares("OEF")
 
 
 def pull_ssga_xlk():
@@ -1058,6 +1059,7 @@ def pull_issuer_holdings(etf):
     elif etf == "TECH.TO": raw = pull_evolve_tech_csv()
     elif etf == "CHPS.TO": raw = pull_globalx_chps_page()
     elif etf == "SOXX": raw = pull_blackrock_soxx()
+    elif etf == "OEF": raw = pull_blackrock_oef()
     elif etf == "SMH": raw = pull_vaneck_smh_page()
     elif etf == "XLK": raw = pull_ssga_xlk()
     else: raise ValueError(f"No ETF config found for {etf}")
@@ -1065,7 +1067,7 @@ def pull_issuer_holdings(etf):
     if etf == "MAGS": sanity_check_weight_total(holdings, etf, low=90, high=120)
     elif etf == "CHAT": sanity_check_weight_total(holdings, etf, low=85, high=115)
     elif etf == "SMH": sanity_check_weight_total(holdings, etf, low=90, high=105)
-    elif etf == "SOXX": sanity_check_weight_total(holdings, etf, low=85, high=110)
+    elif etf in ["SOXX", "OEF"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
     elif etf in ["SPMO", "QQQ"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
     holdings["Source Note"] = f"Issuer-first: {ETF_CONFIG[etf]['issuer']}"
     print(f"{etf}: normalized holdings = {len(holdings)}")
