@@ -90,3 +90,44 @@ def test_dram_rejects_implausible_gross_exposure():
     raw["Weight"] = raw["Weight"] * 1.40
     with pytest.raises(ValueError, match="bad total"):
         pipeline.standardize_roundhill_candidate(raw, "DRAM", "too leveraged fixture")
+
+
+def test_dram_hierarchical_table_uses_company_exposure_rows_only():
+    raw = pd.DataFrame(
+        {
+            "Name": [
+                "Micron Technology Inc", None, None, None,
+                "Samsung Electronics Co", None, None, None,
+                "SK hynix", None, None, None,
+                "CXMT",
+                "Sandisk", "Seagate Technology Holdings", "Western Digital",
+                "Kioxia Holdings", "Nanya Technology", "Winbond Electronics",
+            ],
+            "Ticker": [
+                None, "595112103 TRS 050427 NM", "595112103 TRS 052427 GS", "MU",
+                None, "005930 KS", "6771720 TRS 052427 GS", "005935 KS",
+                None, "000660 KS", "6450267 TRS 052427 GS", "SKHY",
+                "BTMTQT8 TRS 052427 GS",
+                "SNDK", "STX", "WDC", "285A JP", "2408 TT", "2344 TT",
+            ],
+            "Weight": [
+                "26.33%", "16.26%", "9.66%", "0.41%",
+                "25.16%", "19.04%", "6.01%", "0.11%",
+                "22.77%", "16.80%", "5.37%", "0.60%",
+                "5.08%",
+                "4.72%", "4.63%", "3.57%", "3.28%", "2.39%", "1.09%",
+            ],
+        }
+    )
+
+    exposure_rows = pipeline.standardize_dram_exposure_candidate(raw, "fixture")
+    normalized = pipeline.normalize_holdings(exposure_rows, "DRAM")
+
+    # The issuer's company-level exposure is ~99%, while raw stock/swap legs
+    # would double count the same exposures.
+    assert normalized["Weight"].sum() == pytest.approx(99.01, abs=0.02)
+    assert "MU" in set(normalized["Yahoo Ticker"])
+    assert "005930.KS" in set(normalized["Yahoo Ticker"])
+    assert "000660.KS" in set(normalized["Yahoo Ticker"])
+    assert "285A.T" in set(normalized["Yahoo Ticker"])
+    assert not normalized["Raw Ticker"].astype(str).str.contains("595112103 TRS").any()
