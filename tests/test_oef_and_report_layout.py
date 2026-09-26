@@ -47,7 +47,7 @@ def test_oef_blackrock_csv_parser_uses_official_product_id(monkeypatch):
     assert normalized["Weight"].sum() == pytest.approx(100.0, abs=0.001)
     assert seen_urls
     assert "239723" in seen_urls[0]
-    assert "OEF_holdings" in seen_urls[0]
+    assert seen_urls[0].endswith("/latest-holdings.csv")
 
 
 def test_forward_pe_charts_live_on_dedicated_tab(tmp_path):
