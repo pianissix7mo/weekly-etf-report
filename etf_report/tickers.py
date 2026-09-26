@@ -13,7 +13,7 @@ NAME_TO_YAHOO = {
     "advanced micro devices": "AMD", "amd": "AMD", "lam research": "LRCX", "applied materials": "AMAT", "kla": "KLAC", "arm holdings": "ARM",
     "qualcomm": "QCOM", "micron": "MU", "marvell": "MRVL", "monolithic power": "MPWR", "teradyne": "TER", "microchip technology": "MCHP",
     "analog devices": "ADI", "nxp": "NXPI", "on semiconductor": "ON", "texas instruments": "TXN", "intel": "INTC", "synopsys": "SNPS", "cadence": "CDNS",
-    "sk hynix": "000660.KS", "samsung electronics": "005930.KS", "disco corp": "6146.T", "advantest": "6857.T",
+    "berkshire hathaway": "BRK-B", "sk hynix": "000660.KS", "samsung electronics": "005930.KS", "disco corp": "6146.T", "advantest": "6857.T",
 }
 
 
