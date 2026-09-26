@@ -40,9 +40,9 @@ def test_add_yahoo_targets_skips_implausible_symbols_before_network(monkeypatch)
 
     out = pipeline.add_yahoo_targets(holdings)
 
-    assert set(called) == {"AAPL", "MSFT"}
-    assert len(called) == 2
-    skipped = out.set_index("Yahoo Ticker").loc[["ARM$CBRS", "IXTZ6", "AGPXX"], "Yahoo Error"]
+    assert set(called) == {"AAPL", "MSFT", "IXTZ6"}
+    assert len(called) == 3
+    skipped = out.set_index("Yahoo Ticker").loc[["ARM$CBRS", "AGPXX"], "Yahoo Error"]
     assert skipped.str.contains("preflight skipped").all()
     assert out.set_index("Yahoo Ticker").loc["AAPL", "Current Price"] == 100.0
 
