@@ -730,7 +730,7 @@ def standardize_dram_exposure_candidate(raw, source_name):
     company_names = company_rows[name_col].fillna("").astype(str)
     company_rows = company_rows[
         ~company_names.str.lower().str.contains(
-            r"^(total|cash|cash equivalents?|collateral|receivable|payable)$",
+            r"^(?:total|cash|cash equivalents?|collateral|receivable|payable)$",
             regex=True,
             na=False,
         )
@@ -1128,14 +1128,7 @@ def pull_issuer_holdings(etf):
     holdings = normalize_holdings(raw, etf)
     if etf == "MAGS": sanity_check_weight_total(holdings, etf, low=90, high=120)
     elif etf == "CHAT": sanity_check_weight_total(holdings, etf, low=85, high=115)
-    elif etf == "DRAM":
-        cfg = ETF_CONFIG["DRAM"]
-        sanity_check_weight_total(
-            holdings,
-            etf,
-            low=float(cfg.get("min_total_weight", 85)),
-            high=float(cfg.get("max_total_weight", 130)),
-        )
+    elif etf == "DRAM": sanity_check_weight_total(holdings, etf, low=90, high=110)
     elif etf == "SMH": sanity_check_weight_total(holdings, etf, low=90, high=105)
     elif etf in ["SOXX", "OEF"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
     elif etf in ["SPMO", "QQQ"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
