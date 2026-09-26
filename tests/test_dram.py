@@ -70,3 +70,23 @@ def test_dram_dispatch_uses_roundhill_adapter(monkeypatch):
     assert called["dram"] == 1
     assert len(holdings) == 9
     assert holdings["Weight"].sum() == pytest.approx(100.0)
+
+
+def test_dram_preserves_gross_exposure_above_100_percent():
+    raw = _dram_fixture().copy()
+    scale = 115.05 / raw["Weight"].sum()
+    raw["Weight"] = raw["Weight"] * scale
+
+    validated = pipeline.standardize_roundhill_candidate(raw, "DRAM", "gross exposure fixture")
+    normalized = pipeline.normalize_holdings(validated, "DRAM")
+
+    assert normalized["Weight"].sum() == pytest.approx(115.05, abs=0.01)
+    assert pipeline.ETF_CONFIG["DRAM"]["max_total_weight"] == 130
+    assert "gross exposure" in pipeline.ETF_CONFIG["DRAM"]["weight_basis"]
+
+
+def test_dram_rejects_implausible_gross_exposure():
+    raw = _dram_fixture().copy()
+    raw["Weight"] = raw["Weight"] * 1.40
+    with pytest.raises(ValueError, match="bad total"):
+        pipeline.standardize_roundhill_candidate(raw, "DRAM", "too leveraged fixture")
