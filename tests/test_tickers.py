@@ -16,6 +16,7 @@ from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, ma
         ("KRX:5930", "", "", "005930.KS"),
         ("TSX:SHOP", "", "", "SHOP.TO"),
         ("AAPL.O", "", "", "AAPL"),
+        ("BRK B", "Berkshire Hathaway Inc Class B", "", "BRK-B"),
     ],
 )
 def test_map_to_yahoo_symbol_regressions(raw, name, identifier, expected):
