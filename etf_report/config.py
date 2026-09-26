@@ -1,6 +1,6 @@
 from pathlib import Path
 
-ETFS = ["SPMO", "MAGS", "CHAT", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
+ETFS = ["SPMO", "OEF", "MAGS", "CHAT", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
 OUTPUT_DIR = Path("etf_analyst_target_outputs")
 
 YAHOO_SLEEP_SECONDS = 0.25
@@ -46,7 +46,20 @@ ETF_CONFIG = {
         ],
     },
     "CHPS.TO": {"issuer": "Global X Canada", "url": "https://www.globalx.ca/product/chps"},
-    "SOXX": {"issuer": "iShares / BlackRock", "product_id": "239705", "file_name": "SOXX_holdings"},
+    "SOXX": {
+        "issuer": "iShares / BlackRock",
+        "product_id": "239705",
+        "file_name": "SOXX_holdings",
+        "page_url": "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf",
+        "min_rows": 20,
+    },
+    "OEF": {
+        "issuer": "iShares / BlackRock",
+        "product_id": "239723",
+        "file_name": "OEF_holdings",
+        "page_url": "https://www.ishares.com/us/products/239723/ishares-sp-100-etf",
+        "min_rows": 90,
+    },
     "SMH": {
         "issuer": "VanEck US direct XLSX",
         "url": "https://www.vaneck.com/us/en/etf/equity/smh/holdings/download/xlsx/",
