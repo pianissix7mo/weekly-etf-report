@@ -1727,7 +1727,7 @@ def build_fear_greed_summary():
 # EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-REPORT_VERSION = "pe-history-graphs-layout-v10-redo-overlap-from-etf-tabs"
+REPORT_VERSION = "forward-pe-dashboard-v11-oef"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
 REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
@@ -1867,6 +1867,55 @@ def _write_number_or_dash(ws, row, col, val, num_fmt, dash_fmt):
         ws.write(row, col, "-", dash_fmt)
 
 
+def _build_forward_pe_dashboard_stats(hist_1y):
+    rows = []
+    if hist_1y is None or hist_1y.empty:
+        return pd.DataFrame()
+
+    for etf, group in hist_1y.groupby("ETF", sort=False):
+        g = group.sort_values("Date").copy()
+        values = pd.to_numeric(g.get("Forward PE"), errors="coerce").dropna()
+        if values.empty:
+            continue
+
+        current = float(values.iloc[-1])
+        avg = float(values.mean())
+        low = float(values.min())
+        high = float(values.max())
+        premium = (current / avg - 1.0) if avg not in [0, None] else None
+        percentile = float((values <= current).mean())
+
+        coverage = None
+        if "Forward PE coverage" in g.columns:
+            coverage_values = pd.to_numeric(g["Forward PE coverage"], errors="coerce").dropna()
+            if not coverage_values.empty:
+                coverage = float(coverage_values.iloc[-1])
+
+        if premium is None or pd.isna(premium):
+            status = "N/A"
+        elif premium >= 0.05:
+            status = "Above 1Y Avg"
+        elif premium <= -0.05:
+            status = "Below 1Y Avg"
+        else:
+            status = "Near 1Y Avg"
+
+        rows.append({
+            "ETF": str(etf),
+            "Current Forward PE": current,
+            "1Y Avg": avg,
+            "1Y Low": low,
+            "1Y High": high,
+            "Premium/(Discount)": premium,
+            "History Percentile": percentile,
+            "Forward PE Coverage": coverage,
+            "Observations": int(len(values)),
+            "Status": status,
+        })
+
+    return pd.DataFrame(rows)
+
+
 def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_history, chart_start_row, start_col=1):
     title_fmt = workbook.add_format({"bold": True, "font_size": 12})
 
@@ -1874,7 +1923,12 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
         worksheet.write(chart_start_row, start_col, "PE history charts will appear after more runs are saved.")
         forward_ws = workbook.add_worksheet("Forward PE")
         writer.sheets["Forward PE"] = forward_ws
-        forward_ws.write(0, 0, "Forward PE history charts will appear after more runs are saved.")
+        forward_ws.hide_gridlines(2)
+        forward_ws.merge_range("A1:P2", "Forward PE Dashboard", workbook.add_format({
+            "bold": True, "font_size": 22, "font_color": "#FFFFFF",
+            "bg_color": "#0B1F33", "align": "left", "valign": "vcenter",
+        }))
+        forward_ws.write("A4", "Forward PE history charts will appear after more runs are saved.")
         return
 
     hist = pe_history.copy()
@@ -1886,14 +1940,30 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
     if hist_1y.empty:
         hist_1y = hist.copy()
 
-    hist_1y = hist_1y.sort_values(["ETF", "Date"])
+    hist_1y = hist_1y.sort_values(["ETF", "Date"]).reset_index(drop=True)
+    hist_1y["_Forward PE 1Y Avg"] = hist_1y.groupby("ETF")["Forward PE"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").mean()
+    )
+    hist_1y["_Forward PE Latest"] = np.nan
+    for etf, idx in hist_1y.groupby("ETF").groups.items():
+        positions = list(idx)
+        valid = [
+            pos for pos in positions
+            if pd.notna(pd.to_numeric(pd.Series([hist_1y.loc[pos, "Forward PE"]]), errors="coerce").iloc[0])
+        ]
+        if valid:
+            last_pos = valid[-1]
+            hist_1y.loc[last_pos, "_Forward PE Latest"] = hist_1y.loc[last_pos, "Forward PE"]
 
     data_sheet_name = "PE_History_Data"
     data_ws = workbook.add_worksheet(data_sheet_name)
     writer.sheets[data_sheet_name] = data_ws
     data_ws.hide()
 
-    headers = ["Date", "ETF", "PE Ratio", "Forward PE", "PE coverage", "Forward PE coverage", "YTD", "Covered Weight"]
+    headers = [
+        "Date", "ETF", "PE Ratio", "Forward PE", "PE coverage", "Forward PE coverage",
+        "YTD", "Covered Weight", "Forward PE 1Y Avg", "Forward PE Latest"
+    ]
     for col, header in enumerate(headers):
         data_ws.write(0, col, header)
 
@@ -1910,21 +1980,22 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
         _write_number_or_dash(data_ws, r, 5, row.get("Forward PE coverage"), pct_fmt, pct_fmt)
         _write_number_or_dash(data_ws, r, 6, row.get("YTD"), pct_fmt, pct_fmt)
         _write_number_or_dash(data_ws, r, 7, row.get("Covered Weight"), pct_fmt, pct_fmt)
+        _write_number_or_dash(data_ws, r, 8, row.get("_Forward PE 1Y Avg"), num_fmt, num_fmt)
+        latest = row.get("_Forward PE Latest")
+        if latest is not None and pd.notna(latest):
+            data_ws.write_number(r, 9, float(latest), num_fmt)
+        else:
+            data_ws.write_blank(r, 9, None)
 
+    # Summary keeps Current PE history only.
     worksheet.write(chart_start_row, start_col, "Current PE history, last 1 year", title_fmt)
 
-    forward_ws = workbook.add_worksheet("Forward PE")
-    writer.sheets["Forward PE"] = forward_ws
-    forward_ws.write(0, 0, "Forward PE history, last 1 year", title_fmt)
-    forward_ws.set_column("A:P", 12)
+    etf_order = [e for e in ETFS if e in set(hist_1y["ETF"].astype(str))]
+    etf_order += [e for e in hist_1y["ETF"].astype(str).unique() if e not in etf_order]
 
-    etfs = hist_1y["ETF"].dropna().astype(str).unique()
-    for i, etf in enumerate(etfs):
+    for i, etf in enumerate(etf_order):
         summary_chart_row = chart_start_row + 2 + (i // 2) * 16
         summary_chart_col = start_col + (i % 2) * 8
-        forward_chart_row = 2 + (i // 2) * 16
-        forward_chart_col = (i % 2) * 8
-
         seq_positions = [
             j + 1
             for j, (_, row) in enumerate(hist_1y.iterrows())
@@ -1941,28 +2012,226 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
             "name": f"{etf} Current PE",
             "categories": [data_sheet_name, first_row, 0, last_row, 0],
             "values": [data_sheet_name, first_row, 2, last_row, 2],
-            "marker": {"type": "circle", "size": 4},
+            "line": {"color": "#4472C4", "width": 2.25},
+            "marker": {"type": "circle", "size": 4, "border": {"color": "#4472C4"}, "fill": {"color": "#FFFFFF"}},
         })
         current_chart.set_title({"name": f"{etf} Current PE"})
         current_chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
         current_chart.set_y_axis({"name": "PE", "major_gridlines": {"visible": True}})
         current_chart.set_legend({"none": True})
+        current_chart.set_chartarea({"fill": {"color": "#FFFFFF"}, "border": {"color": "#D9E2F3"}})
+        current_chart.set_plotarea({"fill": {"color": "#FFFFFF"}})
         current_chart.set_size({"width": 520, "height": 300})
         worksheet.insert_chart(summary_chart_row, summary_chart_col, current_chart)
 
+    # ---------------- Forward PE Dashboard ----------------
+    forward_ws = workbook.add_worksheet("Forward PE")
+    writer.sheets["Forward PE"] = forward_ws
+    forward_ws.hide_gridlines(2)
+    forward_ws.set_tab_color("#1F4E78")
+    forward_ws.set_zoom(90)
+    forward_ws.set_column("A:A", 3)
+    forward_ws.set_column("B:B", 11)
+    forward_ws.set_column("C:F", 13)
+    forward_ws.set_column("G:H", 17)
+    forward_ws.set_column("I:I", 13)
+    forward_ws.set_column("J:J", 18)
+    forward_ws.set_column("K:P", 12)
+
+    dashboard_title_fmt = workbook.add_format({
+        "bold": True, "font_size": 22, "font_color": "#FFFFFF",
+        "bg_color": "#0B1F33", "align": "left", "valign": "vcenter",
+    })
+    dashboard_subtitle_fmt = workbook.add_format({
+        "font_size": 10, "font_color": "#D9E2F3",
+        "bg_color": "#0B1F33", "align": "left", "valign": "vcenter",
+    })
+    kpi_label_fmt = workbook.add_format({
+        "bold": True, "font_size": 9, "font_color": "#5B6573",
+        "bg_color": "#F3F6FA", "align": "center", "valign": "vcenter",
+        "top": 1, "left": 1, "right": 1, "border_color": "#D9E2F3",
+    })
+    kpi_value_fmt = workbook.add_format({
+        "bold": True, "font_size": 18, "font_color": "#0B1F33",
+        "bg_color": "#FFFFFF", "align": "center", "valign": "vcenter",
+        "bottom": 1, "left": 1, "right": 1, "border_color": "#D9E2F3",
+    })
+    table_header_fmt = workbook.add_format({
+        "bold": True, "font_color": "#FFFFFF", "bg_color": "#1F4E78",
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#D9E2F3",
+    })
+    table_text_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+    })
+    table_num_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "num_format": '0.0x',
+    })
+    table_pct_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "num_format": "0.0%",
+    })
+    table_int_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "num_format": "0",
+    })
+    status_above_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "font_color": "#9C0006", "bg_color": "#FFC7CE",
+    })
+    status_near_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "font_color": "#9C6500", "bg_color": "#FFEB9C",
+    })
+    status_below_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "font_color": "#006100", "bg_color": "#C6EFCE",
+    })
+    section_header_fmt = workbook.add_format({
+        "bold": True, "font_size": 12, "font_color": "#FFFFFF",
+        "bg_color": "#1F4E78", "align": "left", "valign": "vcenter",
+    })
+
+    forward_ws.merge_range("A1:P2", "Forward PE Dashboard", dashboard_title_fmt)
+    forward_ws.merge_range(
+        "A3:P3",
+        "1-year valuation context • Premium/(Discount) compares current Forward PE with its own 1Y average • Percentile shows where today sits in the 1Y history",
+        dashboard_subtitle_fmt,
+    )
+
+    stats = _build_forward_pe_dashboard_stats(hist_1y)
+    tracked_count = int(len(stats))
+    median_fpe = float(stats["Current Forward PE"].median()) if not stats.empty else None
+    avg_premium = float(stats["Premium/(Discount)"].dropna().mean()) if not stats.empty and stats["Premium/(Discount)"].notna().any() else None
+    median_pctile = float(stats["History Percentile"].median()) if not stats.empty else None
+
+    kpis = [
+        ("ETFs Tracked", tracked_count, "count"),
+        ("Median Forward PE", median_fpe, "multiple"),
+        ("Avg vs 1Y Mean", avg_premium, "percent"),
+        ("Median History Percentile", median_pctile, "percent"),
+    ]
+    kpi_blocks = [("B5:D5", "B6:D7"), ("F5:H5", "F6:H7"), ("J5:L5", "J6:L7"), ("N5:P5", "N6:P7")]
+    for (label, value, kind), (label_rng, value_rng) in zip(kpis, kpi_blocks):
+        forward_ws.merge_range(label_rng, label, kpi_label_fmt)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            display = "-"
+        elif kind == "count":
+            display = str(int(value))
+        elif kind == "multiple":
+            display = f"{value:.1f}x"
+        else:
+            display = f"{value:.0%}"
+        forward_ws.merge_range(value_rng, display, kpi_value_fmt)
+
+    forward_ws.merge_range("B9:J9", "Forward PE Cross-Section", section_header_fmt)
+
+    table_headers = [
+        "ETF", "Current", "1Y Avg", "1Y Low", "1Y High",
+        "Premium/(Discount)", "Percentile", "Coverage", "Obs.", "Status"
+    ]
+    table_row = 9  # zero-based row 10
+    for col, header in enumerate(table_headers, start=1):
+        forward_ws.write(table_row, col, header, table_header_fmt)
+
+    if not stats.empty:
+        stats_display = stats.sort_values("Premium/(Discount)", ascending=False, na_position="last").reset_index(drop=True)
+        for i, row in stats_display.iterrows():
+            r = table_row + 1 + i
+            forward_ws.write(r, 1, row["ETF"], table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 2, row["Current Forward PE"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 3, row["1Y Avg"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 4, row["1Y Low"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 5, row["1Y High"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 6, row["Premium/(Discount)"], table_pct_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 7, row["History Percentile"], table_pct_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 8, row["Forward PE Coverage"], table_pct_fmt, table_text_fmt)
+            forward_ws.write_number(r, 9, int(row["Observations"]), table_int_fmt)
+            status = row["Status"]
+            status_fmt = status_near_fmt
+            if status == "Above 1Y Avg":
+                status_fmt = status_above_fmt
+            elif status == "Below 1Y Avg":
+                status_fmt = status_below_fmt
+            forward_ws.write(r, 10, status, status_fmt)
+
+        first_data_excel = table_row + 2
+        last_data_excel = table_row + 1 + len(stats_display)
+        forward_ws.conditional_format(
+            f"G{first_data_excel}:G{last_data_excel}",
+            {"type": "3_color_scale", "min_color": "#C6EFCE", "mid_color": "#FFFFFF", "max_color": "#FFC7CE"},
+        )
+        forward_ws.conditional_format(
+            f"H{first_data_excel}:H{last_data_excel}",
+            {"type": "data_bar", "bar_color": "#5B9BD5"},
+        )
+        forward_ws.conditional_format(
+            f"I{first_data_excel}:I{last_data_excel}",
+            {"type": "data_bar", "bar_color": "#70AD47"},
+        )
+
+    charts_start_row = table_row + max(len(stats), 1) + 4
+    forward_ws.merge_range(charts_start_row - 1, 1, charts_start_row - 1, 15, "Forward PE History — Last 1 Year", section_header_fmt)
+
+    for i, etf in enumerate(etf_order):
+        chart_row = charts_start_row + (i // 2) * 17
+        chart_col = 1 + (i % 2) * 8
+        seq_positions = [
+            j + 1
+            for j, (_, row) in enumerate(hist_1y.iterrows())
+            if str(row.get("ETF")) == etf
+        ]
+        if not seq_positions:
+            continue
+
+        first_row = min(seq_positions)
+        last_row = max(seq_positions)
+        etf_stats = stats[stats["ETF"] == etf]
+        current = float(etf_stats.iloc[0]["Current Forward PE"]) if not etf_stats.empty else None
+        avg = float(etf_stats.iloc[0]["1Y Avg"]) if not etf_stats.empty else None
+        chart_title = f"{etf} | {current:.1f}x vs {avg:.1f}x 1Y avg" if current is not None and avg is not None else f"{etf} Forward PE"
+
         forward_chart = workbook.add_chart({"type": "line"})
         forward_chart.add_series({
-            "name": f"{etf} Forward PE",
+            "name": "Forward PE",
             "categories": [data_sheet_name, first_row, 0, last_row, 0],
             "values": [data_sheet_name, first_row, 3, last_row, 3],
-            "marker": {"type": "diamond", "size": 4},
+            "line": {"color": "#4472C4", "width": 2.5},
+            "marker": {"type": "circle", "size": 4, "border": {"color": "#4472C4"}, "fill": {"color": "#FFFFFF"}},
         })
-        forward_chart.set_title({"name": f"{etf} Forward PE"})
-        forward_chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
-        forward_chart.set_y_axis({"name": "Forward PE", "major_gridlines": {"visible": True}})
-        forward_chart.set_legend({"none": True})
-        forward_chart.set_size({"width": 520, "height": 300})
-        forward_ws.insert_chart(forward_chart_row, forward_chart_col, forward_chart)
+        forward_chart.add_series({
+            "name": "1Y Average",
+            "categories": [data_sheet_name, first_row, 0, last_row, 0],
+            "values": [data_sheet_name, first_row, 8, last_row, 8],
+            "line": {"color": "#ED7D31", "width": 1.5, "dash_type": "dash"},
+            "marker": {"type": "none"},
+        })
+        forward_chart.add_series({
+            "name": "Latest",
+            "categories": [data_sheet_name, first_row, 0, last_row, 0],
+            "values": [data_sheet_name, first_row, 9, last_row, 9],
+            "line": {"none": True},
+            "marker": {"type": "diamond", "size": 8, "border": {"color": "#C00000"}, "fill": {"color": "#C00000"}},
+            "data_labels": {"value": True, "num_format": '0.0x', "position": "above", "font": {"bold": True, "color": "#C00000"}},
+        })
+        forward_chart.set_title({"name": chart_title, "name_font": {"bold": True, "color": "#0B1F33"}})
+        forward_chart.set_x_axis({
+            "date_axis": True, "num_format": "mmm yy",
+            "line": {"color": "#B4C6E7"},
+            "label_position": "low",
+        })
+        forward_chart.set_y_axis({
+            "name": "Forward PE", "num_format": '0.0x',
+            "major_gridlines": {"visible": True, "line": {"color": "#E7ECF2"}},
+            "line": {"color": "#B4C6E7"},
+        })
+        forward_chart.set_legend({"position": "bottom", "font": {"size": 9}})
+        forward_chart.set_chartarea({"fill": {"color": "#FFFFFF"}, "border": {"color": "#D9E2F3"}})
+        forward_chart.set_plotarea({"fill": {"color": "#FFFFFF"}, "border": {"none": True}})
+        forward_chart.set_size({"width": 560, "height": 300})
+        forward_ws.insert_chart(chart_row, chart_col, forward_chart)
+
+    forward_ws.freeze_panes(table_row + 1, 1)
 
 
 def _make_edge_formats(workbook):
