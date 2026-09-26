@@ -97,7 +97,7 @@ def test_forward_pe_dashboard_stats_are_descriptive_and_stable():
             {"Date": "2026-09-01", "ETF": "QQQ", "Forward PE": 24.0, "Forward PE coverage": 0.97},
             {"Date": "2026-07-01", "ETF": "OEF", "Forward PE": 20.0, "Forward PE coverage": 0.99},
             {"Date": "2026-08-01", "ETF": "OEF", "Forward PE": 20.0, "Forward PE coverage": 0.99},
-            {"Date": "2026-09-01", "ETF": "OEF", "Forward PE": 19.0, "Forward PE coverage": 0.99},
+            {"Date": "2026-09-01", "ETF": "OEF", "Forward PE": 18.0, "Forward PE coverage": 0.99},
         ]
     )
     hist["Date"] = pd.to_datetime(hist["Date"])
@@ -110,5 +110,5 @@ def test_forward_pe_dashboard_stats_are_descriptive_and_stable():
     assert stats.loc["QQQ", "Forward PE Coverage"] == pytest.approx(0.97)
     assert stats.loc["QQQ", "Status"] == "Above 1Y Avg"
 
-    assert stats.loc["OEF", "Current Forward PE"] == pytest.approx(19.0)
+    assert stats.loc["OEF", "Current Forward PE"] == pytest.approx(18.0)
     assert stats.loc["OEF", "Status"] == "Below 1Y Avg"
