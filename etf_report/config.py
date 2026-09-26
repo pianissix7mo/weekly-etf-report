@@ -45,9 +45,9 @@ ETF_CONFIG = {
         "url": "https://www.roundhillinvestments.com/etf/dram/",
         "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/DRAM_Factsheet.pdf",
         "min_rows": 8,
-        "min_total_weight": 85,
-        "max_total_weight": 130,
-        "weight_basis": "gross exposure including total return swaps",
+        "min_total_weight": 90,
+        "max_total_weight": 110,
+        "weight_basis": "company-level exposure combining stock positions and total return swaps",
     },
     "TECH.TO": {
         "issuer": "Evolve ETFs",
