@@ -30,68 +30,33 @@ warnings.filterwarnings("ignore")
 # SETTINGS
 # ============================================================
 
-ETFS = ["SPMO", "MAGS", "CHAT", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
-OUTPUT_DIR = Path("etf_analyst_target_outputs")
+from etf_report.analytics import (
+    calculate_returns,
+    weighted_forward_pe,
+    weighted_harmonic_pe,
+)
+from etf_report.config import (
+    AUTO_INSTALL_PLAYWRIGHT_IF_MISSING,
+    ETFS,
+    ETF_CONFIG,
+    HEADERS,
+    ID_COLS,
+    INCLUDE_CASH_FUTURES_SWAPS,
+    NAME_COLS,
+    OUTPUT_DIR,
+    PLAYWRIGHT_TIMEOUT_SECONDS,
+    SHARES_COLS,
+    TICKER_COLS,
+    YAHOO_SLEEP_SECONDS,
+)
+from etf_report.errors import (
+    HoldingsWeightInvalidError,
+    ReportIncompleteError,
+    SourceSchemaChangedError,
+)
+from etf_report.tickers import looks_like_bad_row, map_to_yahoo_symbol
+
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-YAHOO_SLEEP_SECONDS = 0.25
-INCLUDE_CASH_FUTURES_SWAPS = False
-AUTO_INSTALL_PLAYWRIGHT_IF_MISSING = True
-PLAYWRIGHT_TIMEOUT_SECONDS = 150
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-INVESCO_OFFICIAL_PAGE_URLS = {
-    "QQQ": "https://www.invesco.com/qqq-etf/en/about.html",
-    "SPMO": "https://www.invesco.com/us/en/financial-products/etfs/invesco-sp-500-momentum-etf.html",
-}
-
-ETF_CONFIG = {
-    "SPMO": {"issuer": "Invesco official page browser-captured holdings API", "url": INVESCO_OFFICIAL_PAGE_URLS["SPMO"]},
-    "QQQ": {"issuer": "Invesco official page browser-captured holdings API", "url": INVESCO_OFFICIAL_PAGE_URLS["QQQ"]},
-    "MAGS": {
-        "issuer": "Roundhill live holdings",
-        "url": "https://www.roundhillinvestments.com/etf/mags/",
-        "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/MAGS_Factsheet.pdf",
-    },
-    "CHAT": {
-        "issuer": "Roundhill live holdings",
-        "url": "https://www.roundhillinvestments.com/etf/chat/",
-        "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/CHAT_Factsheet.pdf",
-    },
-    "TECH.TO": {
-        "issuer": "Evolve ETFs",
-        "csv_urls": [
-            "https://evolveetfs.com/wp-content/uploads/holdings/TECH.csv",
-            "https://evolveetfs.com/wp-content/uploads/holdings/TECH.CSV",
-        ],
-    },
-    "CHPS.TO": {"issuer": "Global X Canada", "url": "https://www.globalx.ca/product/chps"},
-    "SOXX": {"issuer": "iShares / BlackRock", "product_id": "239705", "file_name": "SOXX_holdings"},
-    "SMH": {
-        "issuer": "VanEck US direct XLSX",
-        "url": "https://www.vaneck.com/us/en/etf/equity/smh/holdings/download/xlsx/",
-        "backup_urls": [
-            "https://www.vaneck.com/us/en/investments/semiconductor-etf-smh/holdings/",
-            "https://www.vaneck.com/offshore/en/investments/semiconductor-etf/holdings/",
-            "https://www.vaneck.com/lu/en/investments/semiconductor-etf/portfolio/",
-        ],
-    },
-    "XLK": {"issuer": "State Street / SSGA", "url": "https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-xlk.xlsx"},
-}
-
-TICKER_COLS = ["Ticker", "Ticker Symbol", "Symbol", "Trading Symbol", "Holding Ticker", "Bloomberg Ticker", "Exchange Ticker"]
-NAME_COLS = ["Name", "Holding", "Holdings", "Holding Name", "Security Name", "Security", "Description", "Company", "Company Name", "Issuer"]
-SHARES_COLS = ["Shares", "Shares Held", "Quantity", "Shares/Par Value", "Par Value"]
-ID_COLS = ["Identifier", "FIGI", "CUSIP", "ISIN", "SEDOL"]
 
 # ============================================================
 # HELPERS
@@ -281,92 +246,26 @@ def choose_best_holdings_table(dfs):
         if score > best_score:
             best, best_score = df, score
     if best is None:
-        raise ValueError("Could not identify holdings table.")
+        raise SourceSchemaChangedError("Could not identify holdings table.")
     return best
 
 # ============================================================
 # TICKER NORMALIZATION
+# Pure ticker mapping helpers live in etf_report.tickers.
 # ============================================================
-
-CUSIP_TO_YAHOO = {
-    "037833100": "AAPL", "594918104": "MSFT", "02079K305": "GOOGL", "02079K107": "GOOG",
-    "023135106": "AMZN", "30303M102": "META", "67066G104": "NVDA", "88160R101": "TSLA", "64110L106": "NFLX",
-}
-
-NAME_TO_YAHOO = {
-    "apple": "AAPL", "microsoft": "MSFT", "alphabet": "GOOGL", "google": "GOOGL", "amazon": "AMZN", "meta platforms": "META", "facebook": "META",
-    "netflix": "NFLX", "nvidia": "NVDA", "tesla": "TSLA", "broadcom": "AVGO", "taiwan semiconductor": "TSM", "tsmc": "TSM", "asml": "ASML",
-    "advanced micro devices": "AMD", "amd": "AMD", "lam research": "LRCX", "applied materials": "AMAT", "kla": "KLAC", "arm holdings": "ARM",
-    "qualcomm": "QCOM", "micron": "MU", "marvell": "MRVL", "monolithic power": "MPWR", "teradyne": "TER", "microchip technology": "MCHP",
-    "analog devices": "ADI", "nxp": "NXPI", "on semiconductor": "ON", "texas instruments": "TXN", "intel": "INTC", "synopsys": "SNPS", "cadence": "CDNS",
-    "sk hynix": "000660.KS", "samsung electronics": "005930.KS", "disco corp": "6146.T", "advantest": "6857.T",
-}
-
-
-def map_name_to_yahoo(name):
-    s = "" if pd.isna(name) else str(name).lower()
-    for key, ticker in NAME_TO_YAHOO.items():
-        if key in s:
-            return ticker
-    return None
-
-
-def looks_like_bad_row(text):
-    text = str(text).lower()
-    bad_terms = ["cash", "cash equivalent", "treasury", "t-bill", "t bill", "money market", "collateral", "repo", "repurchase", "total", "disclaimer", "receivable", "payable"]
-    return any(x in text for x in bad_terms)
-
-
-def map_to_yahoo_symbol(raw_ticker, name="", identifier=""):
-    raw = "" if pd.isna(raw_ticker) else str(raw_ticker).strip()
-    name = "" if pd.isna(name) else str(name).strip()
-    identifier = "" if pd.isna(identifier) else str(identifier).strip()
-    combined = f"{raw} {name} {identifier}".lower()
-    for cusip, yahoo_sym in CUSIP_TO_YAHOO.items():
-        if cusip.lower() in combined:
-            return yahoo_sym
-    name_guess = map_name_to_yahoo(name)
-    if name_guess:
-        return name_guess
-    s = raw.strip()
-    if not s or s.lower() in ["nan", "none", "-", "--"]:
-        return None
-    s = s.replace(" Equity", "").replace(" Common Stock", "").replace("Class A", "").replace("Class C", "").strip()
-    suffix_map = {"US": "", "CN": ".TO", "CT": ".TO", "TT": ".TW", "JT": ".T", "NA": ".AS", "GY": ".DE", "SW": ".SW", "LN": ".L", "HK": ".HK"}
-    for suffix, yahoo_suffix in suffix_map.items():
-        m = re.match(rf"^([A-Z0-9.\-]+)\s+{suffix}$", s, flags=re.I)
-        if m:
-            return m.group(1).replace(".", "-").upper() + yahoo_suffix
-    m = re.match(r"^([0-9]+)\s+(KS|KP)$", s, flags=re.I)
-    if m:
-        return m.group(1).zfill(6) + ".KS"
-    exchange_prefix_map = {"KRX": ".KS", "TPE": ".TW", "TYO": ".T", "AMS": ".AS", "ETR": ".DE", "EPA": ".PA", "SWX": ".SW", "LON": ".L", "HKG": ".HK", "TSX": ".TO"}
-    if ":" in s:
-        prefix, sym = [x.strip() for x in s.split(":", 1)]
-        prefix = prefix.upper()
-        if prefix in exchange_prefix_map:
-            if prefix == "KRX" and sym.isdigit():
-                sym = sym.zfill(6)
-            return sym.replace(".", "-").upper() + exchange_prefix_map[prefix]
-    s = re.sub(r"\.(O|N|A)$", "", s)
-    s = s.replace(".", "-").split()[0].strip().upper()
-    if len(s) > 15 or looks_like_bad_row(f"{s} {name}"):
-        return None
-    return s
-
 
 def normalize_holdings(raw_df, etf):
     df = raw_df.copy().dropna(how="all")
     df.columns = make_unique_columns(df.columns)
     if df.empty:
-        raise ValueError(f"{etf}: issuer holdings table is empty.")
+        raise SourceSchemaChangedError(f"{etf}: issuer holdings table is empty.")
     ticker_col = find_col(df, TICKER_COLS, contains=["ticker", "symbol"])
     name_col = find_col(df, NAME_COLS, contains=["name", "security", "holding", "description", "company"])
     weight_col = find_weight_col_strict(df)
     shares_col = find_col(df, SHARES_COLS, contains=["shares", "quantity"])
     id_col = find_col(df, ID_COLS, contains=["cusip", "isin", "sedol", "identifier", "figi"])
     if weight_col is None:
-        raise ValueError(f"{etf}: could not find real weight column. Columns={list(df.columns)}")
+        raise SourceSchemaChangedError(f"{etf}: could not find real weight column. Columns={list(df.columns)}")
     out = pd.DataFrame()
     out["Raw Ticker"] = first_series(df, ticker_col).astype(str).str.strip() if ticker_col else ""
     out["Name"] = first_series(df, name_col).astype(str).str.strip() if name_col else ""
@@ -376,7 +275,7 @@ def normalize_holdings(raw_df, etf):
     out["ETF"] = etf
     out = out.dropna(subset=["Weight"])
     if out.empty:
-        raise ValueError(f"{etf}: no usable holdings rows after parsing issuer table.")
+        raise SourceSchemaChangedError(f"{etf}: no usable holdings rows after parsing issuer table.")
     if out["Weight"].abs().max() <= 1.5:
         out["Weight"] *= 100
     out["Yahoo Ticker"] = out.apply(lambda r: map_to_yahoo_symbol(r["Raw Ticker"], r["Name"], r["Identifier"]), axis=1)
@@ -387,7 +286,7 @@ def normalize_holdings(raw_df, etf):
     out = out[out["Yahoo Ticker"].astype(str).str.strip() != ""]
     out = out[out["Weight"].abs() > 0.000001]
     if out.empty:
-        raise ValueError(f"{etf}: no equity holdings remained after cleaning.")
+        raise SourceSchemaChangedError(f"{etf}: no equity holdings remained after cleaning.")
     return (out.groupby(["ETF", "Yahoo Ticker"], dropna=False)
         .agg({
             "Raw Ticker": lambda x: "; ".join(sorted(set(map(str, x))))[:300],
@@ -400,7 +299,7 @@ def normalize_holdings(raw_df, etf):
 def sanity_check_weight_total(holdings, etf, low=70, high=130):
     total = holdings["Weight"].sum()
     if total < low or total > high:
-        raise ValueError(f"{etf}: parsed weight total looks wrong: {total:.2f}%.")
+        raise HoldingsWeightInvalidError(f"{etf}: parsed weight total looks wrong: {total:.2f}%.")
     return total
 
 # ============================================================
@@ -1661,41 +1560,7 @@ def add_yahoo_targets(holdings):
 # CALCULATIONS
 # ============================================================
 
-def calculate_returns(df):
-    out = df.copy()
-    out["Weight Decimal"] = out["Weight"] / 100.0
-    out["Low Return"] = out["Target Low"] / out["Current Price"] - 1
-    out["Mean Return"] = out["Target Mean"] / out["Current Price"] - 1
-    out["High Return"] = out["Target High"] / out["Current Price"] - 1
-    out["Median Return"] = out["Target Median"] / out["Current Price"] - 1
-    out["Weighted Low Return"] = out["Weight Decimal"] * out["Low Return"]
-    out["Weighted Mean Return"] = out["Weight Decimal"] * out["Mean Return"]
-    out["Weighted High Return"] = out["Weight Decimal"] * out["High Return"]
-    out["Weighted Median Return"] = out["Weight Decimal"] * out["Median Return"]
-    return out
-
-
-def weighted_harmonic_from_column(df, pe_col):
-    if pe_col not in df.columns: return None, 0.0
-    x = df.dropna(subset=[pe_col, "Weight Decimal"]).copy()
-    x = x[(x[pe_col] > 0) & (x["Weight Decimal"] > 0)]
-    if x.empty: return None, 0.0
-    covered_weight = x["Weight Decimal"].sum()
-    denom = (x["Weight Decimal"] / x[pe_col]).sum()
-    return (None, covered_weight) if denom <= 0 else (covered_weight / denom, covered_weight)
-
-
-def weighted_harmonic_pe(df):
-    x = df.copy()
-    if "Trailing PE" not in x.columns: x["Trailing PE"] = np.nan
-    if "Forward PE" not in x.columns: x["Forward PE"] = np.nan
-    x["PE Used"] = x["Trailing PE"]
-    x.loc[x["PE Used"].isna(), "PE Used"] = x.loc[x["PE Used"].isna(), "Forward PE"]
-    return weighted_harmonic_from_column(x, "PE Used")
-
-
-def weighted_forward_pe(df): return weighted_harmonic_from_column(df, "Forward PE")
-
+# Pure calculation functions live in etf_report.analytics.
 
 def get_etf_current_price(etf):
     try:
@@ -2731,7 +2596,7 @@ def main_with_excel():
         if missing_required:
             print("\nMissing required ETF(s): " + ", ".join(missing_required))
 
-        raise RuntimeError(
+        raise ReportIncompleteError(
             "Report incomplete. No Excel report was exported. "
             "Missing or failed ETF(s): " + ", ".join(missing_required or [f["ETF"] for f in failures])
         )
