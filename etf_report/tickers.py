@@ -49,7 +49,7 @@ def map_to_yahoo_symbol(raw_ticker, name="", identifier=""):
     if not s or s.lower() in ["nan", "none", "-", "--"]:
         return None
     s = s.replace(" Equity", "").replace(" Common Stock", "").replace("Class A", "").replace("Class C", "").strip()
-    suffix_map = {"US": "", "CN": ".TO", "CT": ".TO", "TT": ".TW", "JT": ".T", "NA": ".AS", "GY": ".DE", "SW": ".SW", "LN": ".L", "HK": ".HK"}
+    suffix_map = {"US": "", "CN": ".TO", "CT": ".TO", "TT": ".TW", "JT": ".T", "JP": ".T", "NA": ".AS", "GY": ".DE", "SW": ".SW", "LN": ".L", "HK": ".HK"}
     for suffix, yahoo_suffix in suffix_map.items():
         m = re.match(rf"^([A-Z0-9.\-]+)\s+{suffix}$", s, flags=re.I)
         if m:
