@@ -81,3 +81,34 @@ def test_forward_pe_charts_live_on_dedicated_tab(tmp_path):
     assert wb["PE_History_Data"].sheet_state == "hidden"
     assert len(wb["Summary"]._charts) == 2
     assert len(wb["Forward PE"]._charts) == 2
+    assert wb["Forward PE"]["A1"].value == "Forward PE Dashboard"
+    assert wb["Forward PE"]["B10"].value == "ETF"
+    assert wb["Forward PE"]["G10"].value == "Premium/(Discount)"
+    assert wb["Forward PE"]["H10"].value == "Percentile"
+    assert wb["Forward PE"]["J10"].value == "Obs."
+    assert wb["Forward PE"]["K10"].value == "Status"
+
+
+def test_forward_pe_dashboard_stats_are_descriptive_and_stable():
+    hist = pd.DataFrame(
+        [
+            {"Date": "2026-07-01", "ETF": "QQQ", "Forward PE": 20.0, "Forward PE coverage": 0.95},
+            {"Date": "2026-08-01", "ETF": "QQQ", "Forward PE": 22.0, "Forward PE coverage": 0.96},
+            {"Date": "2026-09-01", "ETF": "QQQ", "Forward PE": 24.0, "Forward PE coverage": 0.97},
+            {"Date": "2026-07-01", "ETF": "OEF", "Forward PE": 20.0, "Forward PE coverage": 0.99},
+            {"Date": "2026-08-01", "ETF": "OEF", "Forward PE": 20.0, "Forward PE coverage": 0.99},
+            {"Date": "2026-09-01", "ETF": "OEF", "Forward PE": 19.0, "Forward PE coverage": 0.99},
+        ]
+    )
+    hist["Date"] = pd.to_datetime(hist["Date"])
+    stats = pipeline._build_forward_pe_dashboard_stats(hist).set_index("ETF")
+
+    assert stats.loc["QQQ", "Current Forward PE"] == pytest.approx(24.0)
+    assert stats.loc["QQQ", "1Y Avg"] == pytest.approx(22.0)
+    assert stats.loc["QQQ", "Premium/(Discount)"] == pytest.approx(24.0 / 22.0 - 1.0)
+    assert stats.loc["QQQ", "History Percentile"] == pytest.approx(1.0)
+    assert stats.loc["QQQ", "Forward PE Coverage"] == pytest.approx(0.97)
+    assert stats.loc["QQQ", "Status"] == "Above 1Y Avg"
+
+    assert stats.loc["OEF", "Current Forward PE"] == pytest.approx(19.0)
+    assert stats.loc["OEF", "Status"] == "Below 1Y Avg"
