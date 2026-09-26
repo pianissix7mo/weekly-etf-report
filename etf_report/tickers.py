@@ -70,3 +70,38 @@ def map_to_yahoo_symbol(raw_ticker, name="", identifier=""):
     if len(s) > 15 or looks_like_bad_row(f"{s} {name}"):
         return None
     return s
+
+
+YAHOO_SUFFIXES = {".TO", ".TW", ".T", ".AS", ".DE", ".SW", ".L", ".HK", ".KS", ".PA"}
+
+
+def is_plausible_yahoo_symbol(symbol):
+    """Cheap preflight filter for symbols that would otherwise waste Yahoo timeouts.
+
+    This is intentionally conservative. It accepts normal US tickers/classes and
+    exchange-suffixed international tickers, while rejecting obvious cash/fund/
+    malformed artifacts seen in issuer holdings feeds.
+    """
+    if symbol is None:
+        return False
+    s = str(symbol).strip().upper()
+    if not s or len(s) > 20 or "$" in s or " " in s:
+        return False
+
+    # Exchange-qualified symbols can legitimately use numeric bases (e.g. 005930.KS).
+    for suffix in sorted(YAHOO_SUFFIXES, key=len, reverse=True):
+        if s.endswith(suffix):
+            base = s[:-len(suffix)]
+            return bool(base) and bool(re.fullmatch(r"[A-Z0-9-]+", base))
+
+    # Plain numeric/alphanumeric artifacts from Asian holdings feeds are not valid
+    # Yahoo US symbols unless the exchange suffix was mapped first.
+    if any(ch.isdigit() for ch in s):
+        return False
+
+    # Money-market / mutual-fund cash sweep tickers commonly end in XX/XXX and do
+    # not provide the stock analyst data this report consumes.
+    if len(s) >= 5 and s.endswith("XX"):
+        return False
+
+    return bool(re.fullmatch(r"[A-Z]{1,6}(?:-[A-Z])?", s))
