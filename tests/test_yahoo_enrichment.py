@@ -181,3 +181,66 @@ def test_prepare_detail_sheet_does_not_refetch_missing_growth(monkeypatch):
 
     out = pipeline.prepare_detail_sheet(details)
     assert pd.isna(out.iloc[0]["Growth Last Year"])
+
+
+def test_normalize_growth_rate_preserves_yfinance_decimal_ratios():
+    assert pipeline.normalize_growth_rate(2.6) == pytest.approx(2.6)
+    assert pipeline.normalize_growth_rate(1.6) == pytest.approx(1.6)
+    assert pipeline.normalize_growth_rate(0.25) == pytest.approx(0.25)
+    assert pipeline.normalize_growth_rate("260%") == pytest.approx(2.6)
+
+
+def test_ytd_uses_prior_year_end_close(monkeypatch):
+    today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+    year_start = pd.Timestamp(year=today.year, month=1, day=1)
+    idx = pd.to_datetime([
+        year_start - pd.Timedelta(days=1),
+        year_start + pd.Timedelta(days=2),
+        max(year_start + pd.Timedelta(days=3), today.normalize()),
+    ])
+    series = pd.Series([100.0, 110.0, 120.0], index=idx)
+    monkeypatch.setattr(pipeline, "_download_adjusted_close", lambda *_args, **_kwargs: series)
+    assert pipeline.get_ytd_return_from_yahoo("TEST") == pytest.approx(0.20)
+
+
+def test_last_calendar_year_uses_prior_year_end_close(monkeypatch):
+    today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+    last_year = today.year - 1
+    start = pd.Timestamp(year=last_year, month=1, day=1)
+    end = pd.Timestamp(year=today.year, month=1, day=1)
+    series = pd.Series(
+        [100.0, 110.0, 130.0],
+        index=pd.to_datetime([
+            start - pd.Timedelta(days=1),
+            start + pd.Timedelta(days=2),
+            end - pd.Timedelta(days=1),
+        ]),
+    )
+    monkeypatch.setattr(pipeline, "_download_adjusted_close", lambda *_args, **_kwargs: series)
+    assert pipeline.get_last_calendar_year_stock_return_from_yahoo("TEST") == pytest.approx(0.30)
+
+
+def test_transient_yahoo_failure_is_not_reused_from_cache(monkeypatch):
+    pipeline.YAHOO_TARGET_CACHE.clear()
+    pipeline.YAHOO_FETCH_TIMINGS.clear()
+    calls = []
+
+    def fake_pull(symbol):
+        calls.append(symbol)
+        if len(calls) == 1:
+            return pipeline._empty_yahoo_row(symbol, "temporary outage")
+        return _fake_row(symbol)
+
+    monkeypatch.setattr(pipeline, "pull_yahoo_targets", fake_pull)
+    monkeypatch.setattr(pipeline, "YAHOO_MAX_WORKERS", 1)
+    monkeypatch.setattr(pipeline, "YAHOO_RETRY_MISSING_GROWTH", False)
+
+    holdings = pd.DataFrame({"Yahoo Ticker": ["AAPL"], "Weight": [100.0]})
+    first = pipeline.add_yahoo_targets(holdings)
+    assert pd.isna(first.iloc[0]["Current Price"])
+    assert "AAPL" not in pipeline.YAHOO_TARGET_CACHE
+
+    second = pipeline.add_yahoo_targets(holdings)
+    assert second.iloc[0]["Current Price"] == 100.0
+    assert calls == ["AAPL", "AAPL"]
+    assert "AAPL" in pipeline.YAHOO_TARGET_CACHE
