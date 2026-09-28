@@ -114,3 +114,23 @@ def test_source_helpers_survive_module_split():
     assert pipeline.INVESCO_OFFICIAL_PAGE_URLS["QQQ"].startswith("https://")
     assert callable(pipeline.map_name_to_yahoo)
     assert pipeline.map_name_to_yahoo("NVIDIA Corporation") == "NVDA"
+
+
+def test_pe_history_read_failure_fails_closed_without_overwrite(tmp_path):
+    history = tmp_path / "ETF_PE_history.xlsx"
+    original = b"not-an-xlsx"
+    history.write_bytes(original)
+    summaries = [{
+        "ETF": "QQQ",
+        "PE Ratio": 30.0,
+        "Forward PE": 25.0,
+        "PE Coverage Weight": 0.9,
+        "Forward PE Coverage Weight": 0.9,
+        "ETF YTD Return": 0.1,
+        "Covered Weight": 0.8,
+    }]
+
+    with pytest.raises(RuntimeError, match="Refusing to rebuild/overwrite"):
+        pipeline.update_pe_history(summaries, history_path=history)
+
+    assert history.read_bytes() == original
