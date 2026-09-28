@@ -77,13 +77,21 @@ def _raw_to_yahoo_symbol(raw):
                 sym = sym.zfill(6)
             return sym.replace(".", "-").upper() + exchange_prefix_map[prefix]
 
+    # Strip Reuters-style exchange suffixes before interpreting a dot as a
+    # share-class separator (AAPL.O -> AAPL, while BRK.B -> BRK-B).
+    s = re.sub(r"\.(O|N|A)$", "", s, flags=re.I)
+
     class_match = re.fullmatch(r"([A-Z]{1,6})[ .\-/]([A-Z])", s, flags=re.I)
     if class_match:
         return f"{class_match.group(1).upper()}-{class_match.group(2).upper()}"
 
-    s = re.sub(r"\.(O|N|A)$", "", s, flags=re.I)
     candidate = s.replace(".", "-").strip().upper()
-    return candidate if is_plausible_yahoo_symbol(candidate) else None
+    if candidate in {"UNKNOWN", "NAN", "NONE", "NULL", "N/A", "NA"}:
+        return None
+    # Preserve issuer-specific opaque security codes (for example DRAM's
+    # private-company exposure identifiers) for portfolio-weight accounting.
+    # The later Yahoo preflight decides whether a code is queryable.
+    return candidate if re.fullmatch(r"[A-Z0-9-]{1,15}", candidate) else None
 
 
 def map_to_yahoo_symbol(raw_ticker, name="", identifier=""):
