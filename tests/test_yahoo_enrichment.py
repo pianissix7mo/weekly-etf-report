@@ -244,3 +244,32 @@ def test_transient_yahoo_failure_is_not_reused_from_cache(monkeypatch):
     assert second.iloc[0]["Current Price"] == 100.0
     assert calls == ["AAPL", "AAPL"]
     assert "AAPL" in pipeline.YAHOO_TARGET_CACHE
+
+
+def test_target_fetch_error_with_price_is_not_cached(monkeypatch):
+    pipeline.YAHOO_TARGET_CACHE.clear()
+    pipeline.YAHOO_FETCH_TIMINGS.clear()
+    calls = []
+
+    def fake_pull(symbol):
+        calls.append(symbol)
+        row = _fake_row(symbol)
+        if len(calls) == 1:
+            row["Target Low"] = None
+            row["Target Mean"] = None
+            row["Target High"] = None
+            row["Target Median"] = None
+            row["Yahoo Error"] = "target error: temporary rate limit"
+        return row
+
+    monkeypatch.setattr(pipeline, "pull_yahoo_targets", fake_pull)
+    monkeypatch.setattr(pipeline, "YAHOO_MAX_WORKERS", 1)
+    monkeypatch.setattr(pipeline, "YAHOO_RETRY_MISSING_GROWTH", False)
+
+    holdings = pd.DataFrame({"Yahoo Ticker": ["NVDA"], "Weight": [100.0]})
+    pipeline.add_yahoo_targets(holdings)
+    assert "NVDA" not in pipeline.YAHOO_TARGET_CACHE
+
+    second = pipeline.add_yahoo_targets(holdings)
+    assert second.iloc[0]["Target Mean"] == 110.0
+    assert calls == ["NVDA", "NVDA"]
