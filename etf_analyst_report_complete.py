@@ -144,10 +144,13 @@ def safe_float_value(x):
 
 
 def normalize_growth_rate(x):
+    if x is None:
+        return None
+    has_percent_sign = isinstance(x, str) and "%" in x
     v = safe_float_value(x)
     if v is None:
         return None
-    return v / 100.0 if abs(v) > 1.5 else v
+    return v / 100.0 if has_percent_sign else v
 
 
 def requests_get(url):
@@ -1158,19 +1161,24 @@ PIPELINE_TIMINGS = {}
 
 
 def get_ytd_return_from_yahoo(symbol):
+    """Calendar YTD total return using the previous year-end adjusted close."""
     try:
-        today = pd.Timestamp.now(tz="America/Toronto")
-        hist = yf.Ticker(symbol).history(
-            start=f"{today.year}-01-01",
-            end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-            auto_adjust=True,
-            actions=False,
-        )
-        close = _clean_close_series(hist)
-        if len(close) < 2:
+        today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+    except Exception:
+        today = pd.Timestamp.today()
+
+    year_start = pd.Timestamp(year=today.year, month=1, day=1)
+    history_start = year_start - pd.Timedelta(days=35)
+    history_end = today + pd.Timedelta(days=1)
+
+    try:
+        close = _download_adjusted_close(symbol, history_start, history_end)
+        baseline = close[close.index < year_start]
+        current_year = close[close.index >= year_start]
+        if baseline.empty or current_year.empty:
             return None
-        first_close = safe_float_value(close.iloc[0])
-        last_close = safe_float_value(close.iloc[-1])
+        first_close = safe_float_value(baseline.iloc[-1])
+        last_close = safe_float_value(current_year.iloc[-1])
         if first_close in [None, 0] or last_close is None:
             return None
         return float(last_close / first_close - 1)
@@ -1293,12 +1301,15 @@ def get_last_calendar_year_stock_return_from_yahoo(symbol):
     last_year = today.year - 1
     start = pd.Timestamp(year=last_year, month=1, day=1)
     end = pd.Timestamp(year=today.year, month=1, day=1)
+    history_start = start - pd.Timedelta(days=35)
 
     try:
-        close = _download_adjusted_close(symbol, start, end)
-        if len(close) >= 2:
-            first_price = safe_float_value(close.iloc[0])
-            last_price = safe_float_value(close.iloc[-1])
+        close = _download_adjusted_close(symbol, history_start, end)
+        baseline = close[close.index < start]
+        last_year_close = close[(close.index >= start) & (close.index < end)]
+        if not baseline.empty and not last_year_close.empty:
+            first_price = safe_float_value(baseline.iloc[-1])
+            last_price = safe_float_value(last_year_close.iloc[-1])
             if first_price not in [None, 0] and last_price is not None:
                 return float(last_price / first_price - 1)
     except Exception:
@@ -1612,6 +1623,16 @@ def _pull_yahoo_targets_timed(symbol):
     return symbol, row, elapsed
 
 
+def _yahoo_row_cacheable(row):
+    """Cache valid results and permanent preflight skips, not transient fetch failures."""
+    if not isinstance(row, dict):
+        return False
+    error = str(row.get("Yahoo Error") or "")
+    if error.startswith("preflight skipped:"):
+        return True
+    return safe_float_value(row.get("Current Price")) is not None
+
+
 def add_yahoo_targets(holdings):
     batch_started = time.perf_counter()
     symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
@@ -1622,9 +1643,13 @@ def add_yahoo_targets(holdings):
 
     for symbol in symbols:
         if symbol in YAHOO_TARGET_CACHE:
-            cached_count += 1
-            result_by_symbol[symbol] = YAHOO_TARGET_CACHE[symbol].copy()
-            continue
+            cached = YAHOO_TARGET_CACHE[symbol]
+            if _yahoo_row_cacheable(cached):
+                cached_count += 1
+                result_by_symbol[symbol] = cached.copy()
+                continue
+            YAHOO_TARGET_CACHE.pop(symbol, None)
+            print(f"Yahoo cache bypassed transient failure: {symbol}")
 
         if not is_plausible_yahoo_symbol(symbol):
             skipped_count += 1
@@ -1651,7 +1676,11 @@ def add_yahoo_targets(holdings):
                 except Exception as e:
                     elapsed = 0.0
                     row = _empty_yahoo_row(symbol, f"unexpected Yahoo future error: {e}")
-                YAHOO_TARGET_CACHE[symbol] = row.copy()
+                if _yahoo_row_cacheable(row):
+                    YAHOO_TARGET_CACHE[symbol] = row.copy()
+                else:
+                    YAHOO_TARGET_CACHE.pop(symbol, None)
+                    print(f"Yahoo transient failure not cached: {symbol}")
                 result_by_symbol[symbol] = row
                 print(f"Yahoo completed {completed}/{len(to_fetch)}: {symbol} ({elapsed:.2f}s)")
 
@@ -1881,15 +1910,24 @@ def update_pe_history(summaries, history_path=None):
             old_df["Date"] = pd.to_datetime(old_df["Date"], errors="coerce").dt.date
             combined = pd.concat([old_df, new_df], ignore_index=True)
         except Exception as e:
-            print(f"Could not read existing PE history, rebuilding it. Error: {e}")
-            combined = new_df
+            raise RuntimeError(
+                f"Could not read existing PE history at {history_path}. "
+                "Refusing to rebuild/overwrite it."
+            ) from e
     else:
         combined = new_df
 
     combined = combined.dropna(subset=["Date", "ETF"], how="any")
     combined = combined.drop_duplicates(subset=["Date", "ETF"], keep="last")
     combined = combined.sort_values(["ETF", "Date"]).reset_index(drop=True)
-    combined.to_excel(history_path, index=False)
+
+    temp_path = history_path.with_name(history_path.name + ".tmp.xlsx")
+    try:
+        combined.to_excel(temp_path, index=False)
+        temp_path.replace(history_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
     print(f"Saved PE history: {history_path}")
     return combined
