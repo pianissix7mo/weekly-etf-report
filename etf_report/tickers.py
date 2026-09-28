@@ -85,12 +85,13 @@ def _raw_to_yahoo_symbol(raw):
     if class_match:
         return f"{class_match.group(1).upper()}-{class_match.group(2).upper()}"
 
-    candidate = s.replace(".", "-").strip().upper()
+    candidate = s.replace(".", "-").split()[0].strip().upper()
     if candidate in {"UNKNOWN", "NAN", "NONE", "NULL", "N/A", "NA"}:
         return None
     # Preserve issuer-specific opaque security codes (for example DRAM's
     # private-company exposure identifiers) for portfolio-weight accounting.
-    # The later Yahoo preflight decides whether a code is queryable.
+    # Bloomberg-style qualifiers after the first token are not part of the
+    # symbol. The later Yahoo preflight decides whether a code is queryable.
     return candidate if re.fullmatch(r"[A-Z0-9-]{1,15}", candidate) else None
 
 
