@@ -51,3 +51,31 @@ def test_empty_ticker_returns_none():
 )
 def test_yahoo_symbol_preflight(symbol, expected):
     assert is_plausible_yahoo_symbol(symbol) is expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "name", "expected"),
+    [
+        ("DOX", "Amdocs Limited", "DOX"),
+        ("KLAR", "Klarna Group", "KLAR"),
+        ("NTLA", "Intellia Therapeutics", "NTLA"),
+        ("CADE", "Cadence Bank", "CADE"),
+        ("PEGY", "Pineapple Energy", "PEGY"),
+    ],
+)
+def test_valid_raw_ticker_wins_over_ambiguous_company_name(raw, name, expected):
+    assert map_to_yahoo_symbol(raw, name, "") == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Amdocs Limited", "Klarna Group", "Intellia Therapeutics", "Cadence Bank", "Pineapple Energy"],
+)
+def test_name_fallback_avoids_substring_false_positives(name):
+    assert map_to_yahoo_symbol("", name, "") is None
+
+
+def test_totalenergies_is_not_filtered_as_summary_total():
+    assert not looks_like_bad_row("TotalEnergies SE")
+    assert looks_like_bad_row("Total")
+    assert looks_like_bad_row("Portfolio Total")
