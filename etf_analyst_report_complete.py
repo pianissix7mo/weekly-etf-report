@@ -1630,7 +1630,14 @@ def _yahoo_row_cacheable(row):
     error = str(row.get("Yahoo Error") or "")
     if error.startswith("preflight skipped:"):
         return True
-    return safe_float_value(row.get("Current Price")) is not None
+    if safe_float_value(row.get("Current Price")) is None:
+        return False
+    # A thrown analyst-target request can materially understate the raw ETF
+    # return calculations. Let a later ETF occurrence retry instead of
+    # propagating one transient Yahoo failure across the whole run.
+    if "target error:" in error.lower():
+        return False
+    return True
 
 
 def add_yahoo_targets(holdings):
