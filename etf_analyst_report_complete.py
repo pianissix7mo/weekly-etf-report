@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -30,68 +31,36 @@ warnings.filterwarnings("ignore")
 # SETTINGS
 # ============================================================
 
-ETFS = ["SPMO", "MAGS", "CHAT", "TECH.TO", "CHPS.TO", "SOXX", "SMH", "XLK", "QQQ"]
-OUTPUT_DIR = Path("etf_analyst_target_outputs")
+from etf_report.analytics import (
+    calculate_returns,
+    weighted_forward_pe,
+    weighted_harmonic_pe,
+)
+from etf_report.config import (
+    AUTO_INSTALL_PLAYWRIGHT_IF_MISSING,
+    ETFS,
+    ETF_CONFIG,
+    HEADERS,
+    ID_COLS,
+    INCLUDE_CASH_FUTURES_SWAPS,
+    INVESCO_OFFICIAL_PAGE_URLS,
+    NAME_COLS,
+    OUTPUT_DIR,
+    PLAYWRIGHT_TIMEOUT_SECONDS,
+    SHARES_COLS,
+    TICKER_COLS,
+    YAHOO_MAX_WORKERS,
+    YAHOO_RETRY_MISSING_GROWTH,
+    YAHOO_SLEEP_SECONDS,
+)
+from etf_report.errors import (
+    HoldingsWeightInvalidError,
+    ReportIncompleteError,
+    SourceSchemaChangedError,
+)
+from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_name_to_yahoo, map_to_yahoo_symbol
+
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-YAHOO_SLEEP_SECONDS = 0.25
-INCLUDE_CASH_FUTURES_SWAPS = False
-AUTO_INSTALL_PLAYWRIGHT_IF_MISSING = True
-PLAYWRIGHT_TIMEOUT_SECONDS = 150
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-INVESCO_OFFICIAL_PAGE_URLS = {
-    "QQQ": "https://www.invesco.com/qqq-etf/en/about.html",
-    "SPMO": "https://www.invesco.com/us/en/financial-products/etfs/invesco-sp-500-momentum-etf.html",
-}
-
-ETF_CONFIG = {
-    "SPMO": {"issuer": "Invesco official page browser-captured holdings API", "url": INVESCO_OFFICIAL_PAGE_URLS["SPMO"]},
-    "QQQ": {"issuer": "Invesco official page browser-captured holdings API", "url": INVESCO_OFFICIAL_PAGE_URLS["QQQ"]},
-    "MAGS": {
-        "issuer": "Roundhill live holdings",
-        "url": "https://www.roundhillinvestments.com/etf/mags/",
-        "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/MAGS_Factsheet.pdf",
-    },
-    "CHAT": {
-        "issuer": "Roundhill live holdings",
-        "url": "https://www.roundhillinvestments.com/etf/chat/",
-        "factsheet_url": "https://www.roundhillinvestments.com/assets/pdfs/CHAT_Factsheet.pdf",
-    },
-    "TECH.TO": {
-        "issuer": "Evolve ETFs",
-        "csv_urls": [
-            "https://evolveetfs.com/wp-content/uploads/holdings/TECH.csv",
-            "https://evolveetfs.com/wp-content/uploads/holdings/TECH.CSV",
-        ],
-    },
-    "CHPS.TO": {"issuer": "Global X Canada", "url": "https://www.globalx.ca/product/chps"},
-    "SOXX": {"issuer": "iShares / BlackRock", "product_id": "239705", "file_name": "SOXX_holdings"},
-    "SMH": {
-        "issuer": "VanEck US direct XLSX",
-        "url": "https://www.vaneck.com/us/en/etf/equity/smh/holdings/download/xlsx/",
-        "backup_urls": [
-            "https://www.vaneck.com/us/en/investments/semiconductor-etf-smh/holdings/",
-            "https://www.vaneck.com/offshore/en/investments/semiconductor-etf/holdings/",
-            "https://www.vaneck.com/lu/en/investments/semiconductor-etf/portfolio/",
-        ],
-    },
-    "XLK": {"issuer": "State Street / SSGA", "url": "https://www.ssga.com/library-content/products/fund-data/etfs/us/holdings-daily-us-en-xlk.xlsx"},
-}
-
-TICKER_COLS = ["Ticker", "Ticker Symbol", "Symbol", "Trading Symbol", "Holding Ticker", "Bloomberg Ticker", "Exchange Ticker"]
-NAME_COLS = ["Name", "Holding", "Holdings", "Holding Name", "Security Name", "Security", "Description", "Company", "Company Name", "Issuer"]
-SHARES_COLS = ["Shares", "Shares Held", "Quantity", "Shares/Par Value", "Par Value"]
-ID_COLS = ["Identifier", "FIGI", "CUSIP", "ISIN", "SEDOL"]
 
 # ============================================================
 # HELPERS
@@ -175,10 +144,13 @@ def safe_float_value(x):
 
 
 def normalize_growth_rate(x):
+    if x is None:
+        return None
+    has_percent_sign = isinstance(x, str) and "%" in x
     v = safe_float_value(x)
     if v is None:
         return None
-    return v / 100.0 if abs(v) > 1.5 else v
+    return v / 100.0 if has_percent_sign else v
 
 
 def requests_get(url):
@@ -281,92 +253,26 @@ def choose_best_holdings_table(dfs):
         if score > best_score:
             best, best_score = df, score
     if best is None:
-        raise ValueError("Could not identify holdings table.")
+        raise SourceSchemaChangedError("Could not identify holdings table.")
     return best
 
 # ============================================================
 # TICKER NORMALIZATION
+# Pure ticker mapping helpers live in etf_report.tickers.
 # ============================================================
-
-CUSIP_TO_YAHOO = {
-    "037833100": "AAPL", "594918104": "MSFT", "02079K305": "GOOGL", "02079K107": "GOOG",
-    "023135106": "AMZN", "30303M102": "META", "67066G104": "NVDA", "88160R101": "TSLA", "64110L106": "NFLX",
-}
-
-NAME_TO_YAHOO = {
-    "apple": "AAPL", "microsoft": "MSFT", "alphabet": "GOOGL", "google": "GOOGL", "amazon": "AMZN", "meta platforms": "META", "facebook": "META",
-    "netflix": "NFLX", "nvidia": "NVDA", "tesla": "TSLA", "broadcom": "AVGO", "taiwan semiconductor": "TSM", "tsmc": "TSM", "asml": "ASML",
-    "advanced micro devices": "AMD", "amd": "AMD", "lam research": "LRCX", "applied materials": "AMAT", "kla": "KLAC", "arm holdings": "ARM",
-    "qualcomm": "QCOM", "micron": "MU", "marvell": "MRVL", "monolithic power": "MPWR", "teradyne": "TER", "microchip technology": "MCHP",
-    "analog devices": "ADI", "nxp": "NXPI", "on semiconductor": "ON", "texas instruments": "TXN", "intel": "INTC", "synopsys": "SNPS", "cadence": "CDNS",
-    "sk hynix": "000660.KS", "samsung electronics": "005930.KS", "disco corp": "6146.T", "advantest": "6857.T",
-}
-
-
-def map_name_to_yahoo(name):
-    s = "" if pd.isna(name) else str(name).lower()
-    for key, ticker in NAME_TO_YAHOO.items():
-        if key in s:
-            return ticker
-    return None
-
-
-def looks_like_bad_row(text):
-    text = str(text).lower()
-    bad_terms = ["cash", "cash equivalent", "treasury", "t-bill", "t bill", "money market", "collateral", "repo", "repurchase", "total", "disclaimer", "receivable", "payable"]
-    return any(x in text for x in bad_terms)
-
-
-def map_to_yahoo_symbol(raw_ticker, name="", identifier=""):
-    raw = "" if pd.isna(raw_ticker) else str(raw_ticker).strip()
-    name = "" if pd.isna(name) else str(name).strip()
-    identifier = "" if pd.isna(identifier) else str(identifier).strip()
-    combined = f"{raw} {name} {identifier}".lower()
-    for cusip, yahoo_sym in CUSIP_TO_YAHOO.items():
-        if cusip.lower() in combined:
-            return yahoo_sym
-    name_guess = map_name_to_yahoo(name)
-    if name_guess:
-        return name_guess
-    s = raw.strip()
-    if not s or s.lower() in ["nan", "none", "-", "--"]:
-        return None
-    s = s.replace(" Equity", "").replace(" Common Stock", "").replace("Class A", "").replace("Class C", "").strip()
-    suffix_map = {"US": "", "CN": ".TO", "CT": ".TO", "TT": ".TW", "JT": ".T", "NA": ".AS", "GY": ".DE", "SW": ".SW", "LN": ".L", "HK": ".HK"}
-    for suffix, yahoo_suffix in suffix_map.items():
-        m = re.match(rf"^([A-Z0-9.\-]+)\s+{suffix}$", s, flags=re.I)
-        if m:
-            return m.group(1).replace(".", "-").upper() + yahoo_suffix
-    m = re.match(r"^([0-9]+)\s+(KS|KP)$", s, flags=re.I)
-    if m:
-        return m.group(1).zfill(6) + ".KS"
-    exchange_prefix_map = {"KRX": ".KS", "TPE": ".TW", "TYO": ".T", "AMS": ".AS", "ETR": ".DE", "EPA": ".PA", "SWX": ".SW", "LON": ".L", "HKG": ".HK", "TSX": ".TO"}
-    if ":" in s:
-        prefix, sym = [x.strip() for x in s.split(":", 1)]
-        prefix = prefix.upper()
-        if prefix in exchange_prefix_map:
-            if prefix == "KRX" and sym.isdigit():
-                sym = sym.zfill(6)
-            return sym.replace(".", "-").upper() + exchange_prefix_map[prefix]
-    s = re.sub(r"\.(O|N|A)$", "", s)
-    s = s.replace(".", "-").split()[0].strip().upper()
-    if len(s) > 15 or looks_like_bad_row(f"{s} {name}"):
-        return None
-    return s
-
 
 def normalize_holdings(raw_df, etf):
     df = raw_df.copy().dropna(how="all")
     df.columns = make_unique_columns(df.columns)
     if df.empty:
-        raise ValueError(f"{etf}: issuer holdings table is empty.")
+        raise SourceSchemaChangedError(f"{etf}: issuer holdings table is empty.")
     ticker_col = find_col(df, TICKER_COLS, contains=["ticker", "symbol"])
     name_col = find_col(df, NAME_COLS, contains=["name", "security", "holding", "description", "company"])
     weight_col = find_weight_col_strict(df)
     shares_col = find_col(df, SHARES_COLS, contains=["shares", "quantity"])
     id_col = find_col(df, ID_COLS, contains=["cusip", "isin", "sedol", "identifier", "figi"])
     if weight_col is None:
-        raise ValueError(f"{etf}: could not find real weight column. Columns={list(df.columns)}")
+        raise SourceSchemaChangedError(f"{etf}: could not find real weight column. Columns={list(df.columns)}")
     out = pd.DataFrame()
     out["Raw Ticker"] = first_series(df, ticker_col).astype(str).str.strip() if ticker_col else ""
     out["Name"] = first_series(df, name_col).astype(str).str.strip() if name_col else ""
@@ -376,7 +282,7 @@ def normalize_holdings(raw_df, etf):
     out["ETF"] = etf
     out = out.dropna(subset=["Weight"])
     if out.empty:
-        raise ValueError(f"{etf}: no usable holdings rows after parsing issuer table.")
+        raise SourceSchemaChangedError(f"{etf}: no usable holdings rows after parsing issuer table.")
     if out["Weight"].abs().max() <= 1.5:
         out["Weight"] *= 100
     out["Yahoo Ticker"] = out.apply(lambda r: map_to_yahoo_symbol(r["Raw Ticker"], r["Name"], r["Identifier"]), axis=1)
@@ -387,7 +293,7 @@ def normalize_holdings(raw_df, etf):
     out = out[out["Yahoo Ticker"].astype(str).str.strip() != ""]
     out = out[out["Weight"].abs() > 0.000001]
     if out.empty:
-        raise ValueError(f"{etf}: no equity holdings remained after cleaning.")
+        raise SourceSchemaChangedError(f"{etf}: no equity holdings remained after cleaning.")
     return (out.groupby(["ETF", "Yahoo Ticker"], dropna=False)
         .agg({
             "Raw Ticker": lambda x: "; ".join(sorted(set(map(str, x))))[:300],
@@ -400,7 +306,7 @@ def normalize_holdings(raw_df, etf):
 def sanity_check_weight_total(holdings, etf, low=70, high=130):
     total = holdings["Weight"].sum()
     if total < low or total > high:
-        raise ValueError(f"{etf}: parsed weight total looks wrong: {total:.2f}%.")
+        raise HoldingsWeightInvalidError(f"{etf}: parsed weight total looks wrong: {total:.2f}%.")
     return total
 
 # ============================================================
@@ -794,6 +700,56 @@ def pull_chat_roundhill_issuer_page():
     return pull_roundhill_issuer_page("CHAT")
 
 
+def pull_dram_roundhill_issuer_page():
+    return pull_roundhill_issuer_page("DRAM")
+
+
+def standardize_dram_exposure_candidate(raw, source_name):
+    """Use Roundhill's company-level DRAM exposure rows, not raw stock/swap legs.
+
+    The DRAM page nests stock and total-return-swap legs beneath a company-level
+    exposure row. Counting both levels double-counts the same economic exposure.
+    Parent/company rows are the issuer's published combined exposure weights.
+    """
+    df = raw.copy().dropna(how="all")
+    df.columns = make_unique_columns(df.columns)
+
+    name_col = find_col(df, NAME_COLS, contains=["name", "company", "holding", "security"])
+    weight_col = find_weight_col_strict(df)
+    ticker_col = find_col(df, TICKER_COLS, contains=["ticker", "symbol"])
+
+    if name_col is None or weight_col is None:
+        raise SourceSchemaChangedError(
+            f"DRAM {source_name}: missing company-level Name/Weight columns. Columns={list(df.columns)}"
+        )
+
+    names = df[name_col].fillna("").astype(str).str.strip()
+    # On Roundhill's hierarchical table, child stock/swap legs have blank Name.
+    company_rows = df[names.ne("")].copy()
+    if company_rows.empty:
+        raise SourceSchemaChangedError(f"DRAM {source_name}: no company-level exposure rows")
+
+    # Exclude non-investment headings/totals if the page ever injects them.
+    company_names = company_rows[name_col].fillna("").astype(str)
+    company_rows = company_rows[
+        ~company_names.str.lower().str.contains(
+            r"^(?:total|cash|cash equivalents?|collateral|receivable|payable)$",
+            regex=True,
+            na=False,
+        )
+    ].copy()
+
+    test = normalize_holdings(company_rows, "DRAM")
+    total = test["Weight"].sum()
+
+    if len(test) < int(ETF_CONFIG["DRAM"].get("min_rows", 8)):
+        raise ValueError(f"DRAM {source_name}: only {len(test)} company exposure rows")
+    if total < 90 or total > 110:
+        raise ValueError(f"DRAM {source_name}: bad company exposure total {total:.2f}%")
+
+    return company_rows
+
+
 def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
     """
     Generic Roundhill holdings validator for MAGS/CHAT.
@@ -802,24 +758,33 @@ def standardize_roundhill_candidate(raw, etf, source_name, min_rows=None):
     passing through normalize_holdings(), so we do not rely on hard-coded equal
     weights or fixed top-holding lists.
     """
+    if etf == "DRAM":
+        return standardize_dram_exposure_candidate(raw, source_name)
+
     test = normalize_holdings(raw, etf)
 
     if min_rows is None:
-        min_rows = 7 if etf == "MAGS" else 20
+        min_rows = int(ETF_CONFIG.get(etf, {}).get("min_rows", 7 if etf == "MAGS" else 20))
 
     if len(test) < min_rows:
         raise ValueError(f"{etf} {source_name}: only {len(test)} rows")
 
     total = test["Weight"].sum()
-    if total < 85 or total > 115:
-        raise ValueError(f"{etf} {source_name}: bad total {total:.2f}%")
+    cfg = ETF_CONFIG.get(etf, {})
+    min_total = float(cfg.get("min_total_weight", 85))
+    max_total = float(cfg.get("max_total_weight", 115))
+    if total < min_total or total > max_total:
+        raise ValueError(
+            f"{etf} {source_name}: bad total {total:.2f}% "
+            f"(expected {min_total:.0f}-{max_total:.0f}%)"
+        )
 
     return raw
 
 
 def pull_roundhill_issuer_page(etf):
     """
-    Pull Roundhill ETF holdings, currently used for MAGS and CHAT.
+    Pull Roundhill ETF holdings, currently used for MAGS, CHAT, and DRAM.
 
     Order of attempts:
       1. Static HTML tables from the issuer page.
@@ -1027,41 +992,39 @@ def pull_globalx_chps_page():
     return pd.DataFrame(rows)
 
 
-def pull_blackrock_soxx():
+def pull_blackrock_ishares(etf):
+    """Pull holdings for an iShares/BlackRock ETF using the official CSV endpoint.
+
+    The direct CSV path is preferred. A rendered product-page fallback is retained
+    because BlackRock occasionally changes the download route or response format.
     """
-    Pull SOXX holdings from BlackRock/iShares.
+    etf = etf.upper()
+    cfg = ETF_CONFIG[etf]
+    product_id = cfg["product_id"]
+    file_name = cfg["file_name"]
+    product_page = cfg["page_url"]
+    min_rows = int(cfg.get("min_rows", 20))
 
-    Fix:
-      BlackRock's current holdings download URL uses:
-        /us/products/239705/fund/1467271812596.ajax?...
-      The older URL without /fund/ can return no usable holdings, which caused SOXX
-      to fail and then disappear from the final emailed workbook.
-    """
-    product_id = ETF_CONFIG["SOXX"]["product_id"]
-    file_name = ETF_CONFIG["SOXX"]["file_name"]
-
-    product_page = f"https://www.ishares.com/us/products/{product_id}/ishares-phlx-semiconductor-etf"
-
-    soxx_headers = dict(HEADERS)
-    soxx_headers.update({
+    headers = dict(HEADERS)
+    headers.update({
         "Accept": "text/csv,application/csv,application/vnd.ms-excel,application/octet-stream,*/*",
         "Referer": product_page,
     })
 
-    # Put the current official BlackRock download endpoint first.
-    # Keep older endpoint shapes as fallbacks in case BlackRock changes routing again.
     urls = [
+        cfg.get("holdings_url"),
         f"https://www.ishares.com/us/products/{product_id}/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
-        f"https://www.ishares.com/us/products/{product_id}/ishares-phlx-semiconductor-etf/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
-        f"https://www.ishares.com/us/products/{product_id}/ishares-phlx-semiconductor-etf/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
+        f"{product_page}/fund/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
+        f"{product_page}/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
         f"https://www.ishares.com/us/products/{product_id}/1467271812596.ajax?dataType=fund&fileName={file_name}&fileType=csv",
     ]
+    urls = [url for url in urls if url]
 
     errors = []
 
     for url in urls:
         try:
-            r = requests.get(url, headers=soxx_headers, timeout=60)
+            r = requests.get(url, headers=headers, timeout=60)
 
             if r.status_code != 200 or len(r.content) < 200:
                 errors.append(f"{url}: status={r.status_code}, bytes={len(r.content)}")
@@ -1074,58 +1037,56 @@ def pull_blackrock_soxx():
                 continue
 
             table = choose_best_holdings_table(dfs)
-
-            # Validate before returning so a disclaimer/summary table cannot pass through.
-            test = normalize_holdings(table, "SOXX")
+            test = normalize_holdings(table, etf)
             n = len(test)
             total = test["Weight"].sum()
 
-            # SOXX is currently a concentrated semiconductor ETF with about 30 holdings.
-            # Use a tolerant range because cash/derivative rows can be excluded.
-            if n < 20 or not (85 <= total <= 110):
-                errors.append(f"{url}: parsed table failed sanity check. rows={n}, total_weight={total:.2f}%")
+            if n < min_rows or not (85 <= total <= 110):
+                errors.append(
+                    f"{url}: parsed table failed sanity check. "
+                    f"rows={n}, total_weight={total:.2f}%"
+                )
                 continue
 
-            print(f"SOXX holdings source used: {url}")
-            print(f"SOXX validation rows={n}, total_weight={total:.2f}%")
+            print(f"{etf} holdings source used: {url}")
+            print(f"{etf} validation rows={n}, total_weight={total:.2f}%")
             return table
 
         except Exception as e:
             errors.append(f"{url}: {repr(e)}")
 
-    # Last resort: render the official page and try to parse/download via Playwright.
     try:
         art = fetch_rendered_artifacts(
             product_page,
             click_texts=["Holdings", "All", "Detailed Holdings and Analytics"],
-            download_texts=["Detailed Holdings and Analytics", "Data Download", "Download"],
+            download_texts=["Detailed Holdings and Analytics", "Data Download", "Download Holdings CSV", "Download"],
             wait_seconds=8,
         )
 
         if art.get("download_bytes"):
             dfs = read_any_file_to_tables(art["download_bytes"])
             table = choose_best_holdings_table(dfs)
-            test = normalize_holdings(table, "SOXX")
+            test = normalize_holdings(table, etf)
             n = len(test)
             total = test["Weight"].sum()
-            if n >= 20 and 85 <= total <= 110:
-                print("SOXX holdings source used: rendered iShares download")
-                print(f"SOXX validation rows={n}, total_weight={total:.2f}%")
+            if n >= min_rows and 85 <= total <= 110:
+                print(f"{etf} holdings source used: rendered iShares download")
+                print(f"{etf} validation rows={n}, total_weight={total:.2f}%")
                 return table
             errors.append(f"rendered download sanity failed: rows={n}, total_weight={total:.2f}%")
 
         try:
             table = try_tables_from_html_for_candidate(
                 art.get("html", ""),
-                "SOXX",
+                etf,
                 lambda raw, source_name: raw,
             )
-            test = normalize_holdings(table, "SOXX")
+            test = normalize_holdings(table, etf)
             n = len(test)
             total = test["Weight"].sum()
-            if n >= 20 and 85 <= total <= 110:
-                print("SOXX holdings source used: rendered iShares HTML")
-                print(f"SOXX validation rows={n}, total_weight={total:.2f}%")
+            if n >= min_rows and 85 <= total <= 110:
+                print(f"{etf} holdings source used: rendered iShares HTML")
+                print(f"{etf} validation rows={n}, total_weight={total:.2f}%")
                 return table
             errors.append(f"rendered HTML sanity failed: rows={n}, total_weight={total:.2f}%")
         except Exception as e:
@@ -1134,8 +1095,15 @@ def pull_blackrock_soxx():
     except Exception as e:
         errors.append(f"rendered page fallback failed: {repr(e)}")
 
-    raise ValueError("SOXX BlackRock holdings could not be parsed. Attempts:\n - " + "\n - ".join(errors))
+    raise ValueError(f"{etf} BlackRock holdings could not be parsed. Attempts:\n - " + "\n - ".join(errors))
 
+
+def pull_blackrock_soxx():
+    return pull_blackrock_ishares("SOXX")
+
+
+def pull_blackrock_oef():
+    return pull_blackrock_ishares("OEF")
 
 
 def pull_ssga_xlk():
@@ -1152,17 +1120,20 @@ def pull_issuer_holdings(etf):
     elif etf == "QQQ": raw = pull_qqq_invesco_browser()
     elif etf == "MAGS": raw = pull_mags_roundhill_issuer_page()
     elif etf == "CHAT": raw = pull_chat_roundhill_issuer_page()
+    elif etf == "DRAM": raw = pull_dram_roundhill_issuer_page()
     elif etf == "TECH.TO": raw = pull_evolve_tech_csv()
     elif etf == "CHPS.TO": raw = pull_globalx_chps_page()
     elif etf == "SOXX": raw = pull_blackrock_soxx()
+    elif etf == "OEF": raw = pull_blackrock_oef()
     elif etf == "SMH": raw = pull_vaneck_smh_page()
     elif etf == "XLK": raw = pull_ssga_xlk()
     else: raise ValueError(f"No ETF config found for {etf}")
     holdings = normalize_holdings(raw, etf)
     if etf == "MAGS": sanity_check_weight_total(holdings, etf, low=90, high=120)
     elif etf == "CHAT": sanity_check_weight_total(holdings, etf, low=85, high=115)
+    elif etf == "DRAM": sanity_check_weight_total(holdings, etf, low=90, high=110)
     elif etf == "SMH": sanity_check_weight_total(holdings, etf, low=90, high=105)
-    elif etf == "SOXX": sanity_check_weight_total(holdings, etf, low=85, high=110)
+    elif etf in ["SOXX", "OEF"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
     elif etf in ["SPMO", "QQQ"]: sanity_check_weight_total(holdings, etf, low=85, high=110)
     holdings["Source Note"] = f"Issuer-first: {ETF_CONFIG[etf]['issuer']}"
     print(f"{etf}: normalized holdings = {len(holdings)}")
@@ -1185,22 +1156,29 @@ NUMERIC_YAHOO_COLUMNS = [
 # Many ETFs share the same holdings, so cache Yahoo responses in one run.
 # This avoids asking Yahoo for AAPL/MSFT/NVDA/etc. again for every ETF tab.
 YAHOO_TARGET_CACHE = {}
+YAHOO_FETCH_TIMINGS = {}
+PIPELINE_TIMINGS = {}
 
 
 def get_ytd_return_from_yahoo(symbol):
+    """Calendar YTD total return using the previous year-end adjusted close."""
     try:
-        today = pd.Timestamp.now(tz="America/Toronto")
-        hist = yf.Ticker(symbol).history(
-            start=f"{today.year}-01-01",
-            end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-            auto_adjust=True,
-            actions=False,
-        )
-        close = _clean_close_series(hist)
-        if len(close) < 2:
+        today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
+    except Exception:
+        today = pd.Timestamp.today()
+
+    year_start = pd.Timestamp(year=today.year, month=1, day=1)
+    history_start = year_start - pd.Timedelta(days=35)
+    history_end = today + pd.Timedelta(days=1)
+
+    try:
+        close = _download_adjusted_close(symbol, history_start, history_end)
+        baseline = close[close.index < year_start]
+        current_year = close[close.index >= year_start]
+        if baseline.empty or current_year.empty:
             return None
-        first_close = safe_float_value(close.iloc[0])
-        last_close = safe_float_value(close.iloc[-1])
+        first_close = safe_float_value(baseline.iloc[-1])
+        last_close = safe_float_value(current_year.iloc[-1])
         if first_close in [None, 0] or last_close is None:
             return None
         return float(last_close / first_close - 1)
@@ -1323,12 +1301,15 @@ def get_last_calendar_year_stock_return_from_yahoo(symbol):
     last_year = today.year - 1
     start = pd.Timestamp(year=last_year, month=1, day=1)
     end = pd.Timestamp(year=today.year, month=1, day=1)
+    history_start = start - pd.Timedelta(days=35)
 
     try:
-        close = _download_adjusted_close(symbol, start, end)
-        if len(close) >= 2:
-            first_price = safe_float_value(close.iloc[0])
-            last_price = safe_float_value(close.iloc[-1])
+        close = _download_adjusted_close(symbol, history_start, end)
+        baseline = close[close.index < start]
+        last_year_close = close[(close.index >= start) & (close.index < end)]
+        if not baseline.empty and not last_year_close.empty:
+            first_price = safe_float_value(baseline.iloc[-1])
+            last_price = safe_float_value(last_year_close.iloc[-1])
             if first_price not in [None, 0] and last_price is not None:
                 return float(last_price / first_price - 1)
     except Exception:
@@ -1457,7 +1438,7 @@ def get_annual_eps_from_financials(ticker_obj):
     return None
 
 
-def get_eps_estimates_from_yfinance(ticker_obj):
+def get_eps_estimates_from_yfinance(ticker_obj, info=None):
     df = get_yf_dataframe(ticker_obj, ["get_earnings_estimate", "earnings_estimate"])
     eps_this_year = None
     eps_next_year = None
@@ -1466,13 +1447,14 @@ def get_eps_estimates_from_yfinance(ticker_obj):
         eps_this_year = row_average_value(find_estimate_row(df, ["0y", "current year", "currentyear", "current fiscal year"]))
         eps_next_year = row_average_value(find_estimate_row(df, ["+1y", "next year", "nextyear", "next fiscal year"]))
 
-    try:
-        info = ticker_obj.get_info()
-    except Exception:
+    if not isinstance(info, dict):
         try:
-            info = ticker_obj.info
+            info = ticker_obj.get_info()
         except Exception:
-            info = {}
+            try:
+                info = ticker_obj.info
+            except Exception:
+                info = {}
 
     if isinstance(info, dict):
         if eps_this_year is None:
@@ -1525,9 +1507,9 @@ def get_growth_estimates_from_yfinance(ticker_obj):
     return pick_value(last_row), pick_value(this_row), pick_value(next_row)
 
 
-def get_eps_and_growth_data(ticker_obj):
+def get_eps_and_growth_data(ticker_obj, info=None):
     eps_last_year = get_annual_eps_from_financials(ticker_obj)
-    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj)
+    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj, info=info)
     _ignore_last, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
 
     return {
@@ -1539,8 +1521,8 @@ def get_eps_and_growth_data(ticker_obj):
     }
 
 
-def pull_yahoo_targets(symbol):
-    out = {
+def _empty_yahoo_row(symbol, error=None):
+    return {
         "Yahoo Ticker": symbol,
         "Current Price": None,
         "Target Low": None,
@@ -1557,8 +1539,12 @@ def pull_yahoo_targets(symbol):
         "Growth Last Year": None,
         "Growth This Year Est": None,
         "Growth Next Year Est": None,
-        "Yahoo Error": None,
+        "Yahoo Error": error,
     }
+
+
+def pull_yahoo_targets(symbol):
+    out = _empty_yahoo_row(symbol)
 
     try:
         t = yf.Ticker(symbol)
@@ -1610,7 +1596,8 @@ def pull_yahoo_targets(symbol):
         out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
 
         try:
-            out.update(get_eps_and_growth_data(t))
+            # Reuse the info payload above instead of fetching quoteSummary twice.
+            out.update(get_eps_and_growth_data(t, info=info))
         except Exception as e:
             out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
 
@@ -1625,77 +1612,177 @@ def pull_yahoo_targets(symbol):
     return out
 
 
-def add_yahoo_targets(holdings):
-    rows = []
-    symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
+def _pull_yahoo_targets_timed(symbol):
+    started = time.perf_counter()
+    try:
+        row = pull_yahoo_targets(symbol)
+    except Exception as e:
+        row = _empty_yahoo_row(symbol, f"unexpected Yahoo worker error: {e}")
+    elapsed = time.perf_counter() - started
+    YAHOO_FETCH_TIMINGS[symbol] = elapsed
+    return symbol, row, elapsed
 
-    for i, symbol in enumerate(symbols, 1):
+
+def _yahoo_row_cacheable(row):
+    """Cache valid results and permanent preflight skips, not transient fetch failures."""
+    if not isinstance(row, dict):
+        return False
+    error = str(row.get("Yahoo Error") or "")
+    if error.startswith("preflight skipped:"):
+        return True
+    if safe_float_value(row.get("Current Price")) is None:
+        return False
+    # A thrown analyst-target request can materially understate the raw ETF
+    # return calculations. Let a later ETF occurrence retry instead of
+    # propagating one transient Yahoo failure across the whole run.
+    if "target error:" in error.lower():
+        return False
+    return True
+
+
+def add_yahoo_targets(holdings):
+    batch_started = time.perf_counter()
+    symbols = sorted(holdings["Yahoo Ticker"].dropna().astype(str).unique())
+    result_by_symbol = {}
+    cached_count = 0
+    skipped_count = 0
+    to_fetch = []
+
+    for symbol in symbols:
         if symbol in YAHOO_TARGET_CACHE:
-            print(f"Yahoo targets cached {i}/{len(symbols)}: {symbol}")
-            rows.append(YAHOO_TARGET_CACHE[symbol].copy())
+            cached = YAHOO_TARGET_CACHE[symbol]
+            if _yahoo_row_cacheable(cached):
+                cached_count += 1
+                result_by_symbol[symbol] = cached.copy()
+                continue
+            YAHOO_TARGET_CACHE.pop(symbol, None)
+            print(f"Yahoo cache bypassed transient failure: {symbol}")
+
+        if not is_plausible_yahoo_symbol(symbol):
+            skipped_count += 1
+            row = _empty_yahoo_row(symbol, "preflight skipped: implausible Yahoo equity symbol")
+            YAHOO_TARGET_CACHE[symbol] = row.copy()
+            result_by_symbol[symbol] = row
+            print(f"Yahoo preflight skipped: {symbol}")
             continue
 
-        print(f"Yahoo targets + PE + YTD + EPS + Growth {i}/{len(symbols)}: {symbol}")
-        row = pull_yahoo_targets(symbol)
-        YAHOO_TARGET_CACHE[symbol] = row.copy()
-        rows.append(row)
-        time.sleep(YAHOO_SLEEP_SECONDS)
+        to_fetch.append(symbol)
 
+    if to_fetch:
+        workers = max(1, min(int(YAHOO_MAX_WORKERS), len(to_fetch)))
+        print(
+            f"Yahoo batch: fetching {len(to_fetch)} new symbol(s) with {workers} worker(s); "
+            f"{cached_count} cached, {skipped_count} preflight-skipped"
+        )
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="yahoo") as executor:
+            futures = {executor.submit(_pull_yahoo_targets_timed, symbol): symbol for symbol in to_fetch}
+            for completed, future in enumerate(as_completed(futures), 1):
+                symbol = futures[future]
+                try:
+                    _, row, elapsed = future.result()
+                except Exception as e:
+                    elapsed = 0.0
+                    row = _empty_yahoo_row(symbol, f"unexpected Yahoo future error: {e}")
+                if _yahoo_row_cacheable(row):
+                    YAHOO_TARGET_CACHE[symbol] = row.copy()
+                else:
+                    YAHOO_TARGET_CACHE.pop(symbol, None)
+                    print(f"Yahoo transient failure not cached: {symbol}")
+                result_by_symbol[symbol] = row
+                print(f"Yahoo completed {completed}/{len(to_fetch)}: {symbol} ({elapsed:.2f}s)")
+
+    rows = [result_by_symbol[symbol] for symbol in symbols]
     targets = pd.DataFrame(rows)
     merged = holdings.merge(targets, on="Yahoo Ticker", how="left")
 
-    for c in NUMERIC_YAHOO_COLUMNS:
-        if c in merged.columns:
-            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+    for col in NUMERIC_YAHOO_COLUMNS:
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
-    if "Growth Last Year" in merged.columns:
+    # The per-symbol worker already makes multiple adjusted-history attempts. The
+    # old unconditional second pass could repeat the slowest failing Yahoo calls.
+    # Keep it available as a compatibility knob, but default it off in refactor-safe.
+    if YAHOO_RETRY_MISSING_GROWTH and "Growth Last Year" in merged.columns:
         missing = merged["Growth Last Year"].isna()
         if missing.any():
             for sym in merged.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
+                if not is_plausible_yahoo_symbol(sym):
+                    continue
                 val = get_last_calendar_year_stock_return_from_yahoo(sym)
                 if val is not None:
                     merged.loc[merged["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
 
+    elapsed = time.perf_counter() - batch_started
+    fetched_timings = [(s, YAHOO_FETCH_TIMINGS.get(s, 0.0)) for s in to_fetch]
+    slowest = sorted(fetched_timings, key=lambda x: x[1], reverse=True)[:5]
+    slow_text = ", ".join(f"{s}={secs:.1f}s" for s, secs in slowest) if slowest else "none"
+    print(
+        f"Yahoo batch complete: {len(symbols)} symbols in {elapsed:.2f}s "
+        f"(new={len(to_fetch)}, cached={cached_count}, skipped={skipped_count}); slowest: {slow_text}"
+    )
     return merged
+
+
+def validate_yahoo_data_quality(df, summary, etf):
+    """Fail closed when Yahoo coverage collapses enough to make the report misleading."""
+    if df is None or df.empty:
+        raise ReportIncompleteError(f"{etf}: Yahoo enrichment returned no rows.")
+
+    if "Weight Decimal" not in df.columns:
+        raise ReportIncompleteError(f"{etf}: Yahoo quality check is missing portfolio weights.")
+
+    weights = pd.to_numeric(df["Weight Decimal"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    total_weight = float(weights.sum())
+    if total_weight <= 0:
+        raise ReportIncompleteError(f"{etf}: Yahoo quality check found zero usable portfolio weight.")
+
+    if "Current Price" in df.columns:
+        prices = pd.to_numeric(df["Current Price"], errors="coerce")
+    else:
+        prices = pd.Series(np.nan, index=df.index, dtype=float)
+
+    price_coverage = float(weights[prices.notna()].sum() / total_weight)
+
+    covered_weight = safe_float_value(summary.get("Covered Weight")) or 0.0
+    pe_weight = safe_float_value(summary.get("PE Coverage Weight")) or 0.0
+    forward_pe_weight = safe_float_value(summary.get("Forward PE Coverage Weight")) or 0.0
+
+    target_coverage = float(covered_weight / total_weight)
+    pe_coverage = float(pe_weight / total_weight)
+    forward_pe_coverage = float(forward_pe_weight / total_weight)
+
+    failures = []
+    if price_coverage < 0.50:
+        failures.append(f"price coverage {price_coverage:.1%} < 50%")
+    if target_coverage < 0.05:
+        failures.append(f"analyst-target coverage {target_coverage:.1%} < 5%")
+    if max(pe_coverage, forward_pe_coverage) < 0.01:
+        failures.append(
+            f"PE coverage collapsed (trailing {pe_coverage:.1%}, forward {forward_pe_coverage:.1%})"
+        )
+
+    if failures:
+        error_rows = 0
+        if "Yahoo Error" in df.columns:
+            error_rows = int(df["Yahoo Error"].notna().sum())
+        raise ReportIncompleteError(
+            f"{etf}: Yahoo data quality check failed: "
+            + "; ".join(failures)
+            + f". Yahoo-error rows={error_rows}/{len(df)}. "
+            + "Refusing to write history or export/send a misleading report."
+        )
+
+    print(
+        f"{etf}: Yahoo quality OK — price={price_coverage:.1%}, "
+        f"targets={target_coverage:.1%}, PE={pe_coverage:.1%}, "
+        f"forward PE={forward_pe_coverage:.1%}"
+    )
+
 
 # CALCULATIONS
 # ============================================================
 
-def calculate_returns(df):
-    out = df.copy()
-    out["Weight Decimal"] = out["Weight"] / 100.0
-    out["Low Return"] = out["Target Low"] / out["Current Price"] - 1
-    out["Mean Return"] = out["Target Mean"] / out["Current Price"] - 1
-    out["High Return"] = out["Target High"] / out["Current Price"] - 1
-    out["Median Return"] = out["Target Median"] / out["Current Price"] - 1
-    out["Weighted Low Return"] = out["Weight Decimal"] * out["Low Return"]
-    out["Weighted Mean Return"] = out["Weight Decimal"] * out["Mean Return"]
-    out["Weighted High Return"] = out["Weight Decimal"] * out["High Return"]
-    out["Weighted Median Return"] = out["Weight Decimal"] * out["Median Return"]
-    return out
-
-
-def weighted_harmonic_from_column(df, pe_col):
-    if pe_col not in df.columns: return None, 0.0
-    x = df.dropna(subset=[pe_col, "Weight Decimal"]).copy()
-    x = x[(x[pe_col] > 0) & (x["Weight Decimal"] > 0)]
-    if x.empty: return None, 0.0
-    covered_weight = x["Weight Decimal"].sum()
-    denom = (x["Weight Decimal"] / x[pe_col]).sum()
-    return (None, covered_weight) if denom <= 0 else (covered_weight / denom, covered_weight)
-
-
-def weighted_harmonic_pe(df):
-    x = df.copy()
-    if "Trailing PE" not in x.columns: x["Trailing PE"] = np.nan
-    if "Forward PE" not in x.columns: x["Forward PE"] = np.nan
-    x["PE Used"] = x["Trailing PE"]
-    x.loc[x["PE Used"].isna(), "PE Used"] = x.loc[x["PE Used"].isna(), "Forward PE"]
-    return weighted_harmonic_from_column(x, "PE Used")
-
-
-def weighted_forward_pe(df): return weighted_harmonic_from_column(df, "Forward PE")
-
+# Pure calculation functions live in etf_report.analytics.
 
 def get_etf_current_price(etf):
     try:
@@ -1794,7 +1881,7 @@ def build_fear_greed_summary():
 # EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-REPORT_VERSION = "pe-history-graphs-layout-v10-redo-overlap-from-etf-tabs"
+REPORT_VERSION = "forward-pe-dashboard-v12-dram"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
 REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
@@ -1830,15 +1917,24 @@ def update_pe_history(summaries, history_path=None):
             old_df["Date"] = pd.to_datetime(old_df["Date"], errors="coerce").dt.date
             combined = pd.concat([old_df, new_df], ignore_index=True)
         except Exception as e:
-            print(f"Could not read existing PE history, rebuilding it. Error: {e}")
-            combined = new_df
+            raise RuntimeError(
+                f"Could not read existing PE history at {history_path}. "
+                "Refusing to rebuild/overwrite it."
+            ) from e
     else:
         combined = new_df
 
     combined = combined.dropna(subset=["Date", "ETF"], how="any")
     combined = combined.drop_duplicates(subset=["Date", "ETF"], keep="last")
     combined = combined.sort_values(["ETF", "Date"]).reset_index(drop=True)
-    combined.to_excel(history_path, index=False)
+
+    temp_path = history_path.with_name(history_path.name + ".tmp.xlsx")
+    try:
+        combined.to_excel(temp_path, index=False)
+        temp_path.replace(history_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
     print(f"Saved PE history: {history_path}")
     return combined
@@ -1890,16 +1986,11 @@ def build_excel_summary_rows(summary_df):
 def prepare_detail_sheet(details):
     df = details.copy()
 
+    # Export must be a pure formatting step. Yahoo data was already fetched in
+    # add_yahoo_targets(); retrying missing values here caused serial duplicate
+    # network calls every time detail/overlap sheets were built.
     if "Growth Last Year" not in df.columns:
         df["Growth Last Year"] = np.nan
-
-    if "Yahoo Ticker" in df.columns:
-        missing = df["Growth Last Year"].isna()
-        if missing.any():
-            for sym in df.loc[missing, "Yahoo Ticker"].dropna().astype(str).unique():
-                val = get_last_calendar_year_stock_return_from_yahoo(sym)
-                if val is not None:
-                    df.loc[df["Yahoo Ticker"].astype(str) == sym, "Growth Last Year"] = val
 
     out = pd.DataFrame()
     out["Ticker"] = df["Yahoo Ticker"]
@@ -1934,9 +2025,68 @@ def _write_number_or_dash(ws, row, col, val, num_fmt, dash_fmt):
         ws.write(row, col, "-", dash_fmt)
 
 
+def _build_forward_pe_dashboard_stats(hist_1y):
+    rows = []
+    if hist_1y is None or hist_1y.empty:
+        return pd.DataFrame()
+
+    for etf, group in hist_1y.groupby("ETF", sort=False):
+        g = group.sort_values("Date").copy()
+        values = pd.to_numeric(g.get("Forward PE"), errors="coerce").dropna()
+        if values.empty:
+            continue
+
+        current = float(values.iloc[-1])
+        avg = float(values.mean())
+        low = float(values.min())
+        high = float(values.max())
+        premium = (current / avg - 1.0) if avg not in [0, None] else None
+        percentile = float((values <= current).mean())
+
+        coverage = None
+        if "Forward PE coverage" in g.columns:
+            coverage_values = pd.to_numeric(g["Forward PE coverage"], errors="coerce").dropna()
+            if not coverage_values.empty:
+                coverage = float(coverage_values.iloc[-1])
+
+        if premium is None or pd.isna(premium):
+            status = "N/A"
+        elif premium >= 0.05:
+            status = "Above 1Y Avg"
+        elif premium <= -0.05:
+            status = "Below 1Y Avg"
+        else:
+            status = "Near 1Y Avg"
+
+        rows.append({
+            "ETF": str(etf),
+            "Current Forward PE": current,
+            "1Y Avg": avg,
+            "1Y Low": low,
+            "1Y High": high,
+            "Premium/(Discount)": premium,
+            "History Percentile": percentile,
+            "Forward PE Coverage": coverage,
+            "Observations": int(len(values)),
+            "Status": status,
+        })
+
+    return pd.DataFrame(rows)
+
+
 def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_history, chart_start_row, start_col=1):
+    title_fmt = workbook.add_format({"bold": True, "font_size": 12})
+
     if pe_history is None or pe_history.empty:
         worksheet.write(chart_start_row, start_col, "PE history charts will appear after more runs are saved.")
+        forward_ws = workbook.add_worksheet("Forward PE")
+        writer.sheets["Forward PE"] = forward_ws
+        forward_ws.hide_gridlines(2)
+        forward_ws.merge_range("A1:P2", "Forward PE Dashboard", workbook.add_format({
+            "bold": True, "font_size": 22, "font_color": "#FFFFFF",
+            "bg_color": "#0B1F33", "align": "left", "valign": "vcenter",
+        }))
+        forward_ws.write("A4", "Forward PE history charts will appear after more runs are saved.")
         return
 
     hist = pe_history.copy()
@@ -1948,16 +2098,32 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
     if hist_1y.empty:
         hist_1y = hist.copy()
 
-    hist_1y = hist_1y.sort_values(["ETF", "Date"])
+    hist_1y = hist_1y.sort_values(["ETF", "Date"]).reset_index(drop=True)
+    hist_1y["_Forward PE 1Y Avg"] = hist_1y.groupby("ETF")["Forward PE"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").mean()
+    )
+    hist_1y["_Forward PE Latest"] = np.nan
+    for etf, idx in hist_1y.groupby("ETF").groups.items():
+        positions = list(idx)
+        valid = [
+            pos for pos in positions
+            if pd.notna(pd.to_numeric(pd.Series([hist_1y.loc[pos, "Forward PE"]]), errors="coerce").iloc[0])
+        ]
+        if valid:
+            last_pos = valid[-1]
+            hist_1y.loc[last_pos, "_Forward PE Latest"] = hist_1y.loc[last_pos, "Forward PE"]
 
     data_sheet_name = "PE_History_Data"
     data_ws = workbook.add_worksheet(data_sheet_name)
     writer.sheets[data_sheet_name] = data_ws
     data_ws.hide()
 
-    headers = ["Date", "ETF", "PE Ratio", "Forward PE", "PE coverage", "Forward PE coverage", "YTD", "Covered Weight"]
-    for c, h in enumerate(headers):
-        data_ws.write(0, c, h)
+    headers = [
+        "Date", "ETF", "PE Ratio", "Forward PE", "PE coverage", "Forward PE coverage",
+        "YTD", "Covered Weight", "Forward PE 1Y Avg", "Forward PE Latest"
+    ]
+    for col, header in enumerate(headers):
+        data_ws.write(0, col, header)
 
     date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd"})
     num_fmt = workbook.add_format({"num_format": "0.00"})
@@ -1972,39 +2138,258 @@ def _write_summary_pe_history_data_and_charts(workbook, worksheet, writer, pe_hi
         _write_number_or_dash(data_ws, r, 5, row.get("Forward PE coverage"), pct_fmt, pct_fmt)
         _write_number_or_dash(data_ws, r, 6, row.get("YTD"), pct_fmt, pct_fmt)
         _write_number_or_dash(data_ws, r, 7, row.get("Covered Weight"), pct_fmt, pct_fmt)
+        _write_number_or_dash(data_ws, r, 8, row.get("_Forward PE 1Y Avg"), num_fmt, num_fmt)
+        latest = row.get("_Forward PE Latest")
+        if latest is not None and pd.notna(latest):
+            data_ws.write_number(r, 9, float(latest), num_fmt)
+        else:
+            data_ws.write_blank(r, 9, None)
 
-    worksheet.write(chart_start_row, start_col, "PE history, last 1 year", workbook.add_format({"bold": True, "font_size": 12}))
+    # Summary keeps Current PE history only.
+    worksheet.write(chart_start_row, start_col, "Current PE history, last 1 year", title_fmt)
 
-    for i, etf in enumerate(hist_1y["ETF"].dropna().astype(str).unique()):
-        chart_row = chart_start_row + 2 + (i // 2) * 16
-        chart_col = start_col + (i % 2) * 8
-        seq_positions = [j + 1 for j, (_, row) in enumerate(hist_1y.iterrows()) if str(row.get("ETF")) == etf]
+    etf_order = [e for e in ETFS if e in set(hist_1y["ETF"].astype(str))]
+    etf_order += [e for e in hist_1y["ETF"].astype(str).unique() if e not in etf_order]
 
+    for i, etf in enumerate(etf_order):
+        summary_chart_row = chart_start_row + 2 + (i // 2) * 16
+        summary_chart_col = start_col + (i % 2) * 8
+        seq_positions = [
+            j + 1
+            for j, (_, row) in enumerate(hist_1y.iterrows())
+            if str(row.get("ETF")) == etf
+        ]
         if not seq_positions:
             continue
 
         first_row = min(seq_positions)
         last_row = max(seq_positions)
 
-        chart = workbook.add_chart({"type": "line"})
-        chart.add_series({
+        current_chart = workbook.add_chart({"type": "line"})
+        current_chart.add_series({
             "name": f"{etf} Current PE",
             "categories": [data_sheet_name, first_row, 0, last_row, 0],
             "values": [data_sheet_name, first_row, 2, last_row, 2],
-            "marker": {"type": "circle", "size": 4},
+            "line": {"color": "#4472C4", "width": 2.25},
+            "marker": {"type": "circle", "size": 4, "border": {"color": "#4472C4"}, "fill": {"color": "#FFFFFF"}},
         })
-        chart.add_series({
-            "name": f"{etf} Forward PE",
+        current_chart.set_title({"name": f"{etf} Current PE"})
+        current_chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
+        current_chart.set_y_axis({"name": "PE", "major_gridlines": {"visible": True}})
+        current_chart.set_legend({"none": True})
+        current_chart.set_chartarea({"fill": {"color": "#FFFFFF"}, "border": {"color": "#D9E2F3"}})
+        current_chart.set_plotarea({"fill": {"color": "#FFFFFF"}})
+        current_chart.set_size({"width": 520, "height": 300})
+        worksheet.insert_chart(summary_chart_row, summary_chart_col, current_chart)
+
+    # ---------------- Forward PE Dashboard ----------------
+    forward_ws = workbook.add_worksheet("Forward PE")
+    writer.sheets["Forward PE"] = forward_ws
+    forward_ws.hide_gridlines(2)
+    forward_ws.set_tab_color("#1F4E78")
+    forward_ws.set_zoom(90)
+    forward_ws.set_column("A:A", 3)
+    forward_ws.set_column("B:B", 11)
+    forward_ws.set_column("C:F", 13)
+    forward_ws.set_column("G:H", 17)
+    forward_ws.set_column("I:I", 13)
+    forward_ws.set_column("J:J", 18)
+    forward_ws.set_column("K:P", 12)
+
+    dashboard_title_fmt = workbook.add_format({
+        "bold": True, "font_size": 22, "font_color": "#FFFFFF",
+        "bg_color": "#0B1F33", "align": "left", "valign": "vcenter",
+    })
+    dashboard_subtitle_fmt = workbook.add_format({
+        "font_size": 10, "font_color": "#D9E2F3",
+        "bg_color": "#0B1F33", "align": "left", "valign": "vcenter",
+    })
+    kpi_label_fmt = workbook.add_format({
+        "bold": True, "font_size": 9, "font_color": "#5B6573",
+        "bg_color": "#F3F6FA", "align": "center", "valign": "vcenter",
+        "top": 1, "left": 1, "right": 1, "border_color": "#D9E2F3",
+    })
+    kpi_value_fmt = workbook.add_format({
+        "bold": True, "font_size": 18, "font_color": "#0B1F33",
+        "bg_color": "#FFFFFF", "align": "center", "valign": "vcenter",
+        "bottom": 1, "left": 1, "right": 1, "border_color": "#D9E2F3",
+    })
+    table_header_fmt = workbook.add_format({
+        "bold": True, "font_color": "#FFFFFF", "bg_color": "#1F4E78",
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#D9E2F3",
+    })
+    table_text_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+    })
+    table_num_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "num_format": '0.0x',
+    })
+    table_pct_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "num_format": "0.0%",
+    })
+    table_int_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "num_format": "0",
+    })
+    status_above_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "font_color": "#9C0006", "bg_color": "#FFC7CE",
+    })
+    status_near_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "font_color": "#9C6500", "bg_color": "#FFEB9C",
+    })
+    status_below_fmt = workbook.add_format({
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#E7ECF2",
+        "font_color": "#006100", "bg_color": "#C6EFCE",
+    })
+    section_header_fmt = workbook.add_format({
+        "bold": True, "font_size": 12, "font_color": "#FFFFFF",
+        "bg_color": "#1F4E78", "align": "left", "valign": "vcenter",
+    })
+
+    forward_ws.merge_range("A1:P2", "Forward PE Dashboard", dashboard_title_fmt)
+    forward_ws.merge_range(
+        "A3:P3",
+        "1-year valuation context • Premium/(Discount) compares current Forward PE with its own 1Y average • Percentile shows where today sits in the 1Y history",
+        dashboard_subtitle_fmt,
+    )
+
+    stats = _build_forward_pe_dashboard_stats(hist_1y)
+    tracked_count = int(len(stats))
+    median_fpe = float(stats["Current Forward PE"].median()) if not stats.empty else None
+    avg_premium = float(stats["Premium/(Discount)"].dropna().mean()) if not stats.empty and stats["Premium/(Discount)"].notna().any() else None
+    median_pctile = float(stats["History Percentile"].median()) if not stats.empty else None
+
+    kpis = [
+        ("ETFs Tracked", tracked_count, "count"),
+        ("Median Forward PE", median_fpe, "multiple"),
+        ("Avg vs 1Y Mean", avg_premium, "percent"),
+        ("Median History Percentile", median_pctile, "percent"),
+    ]
+    kpi_blocks = [("B5:D5", "B6:D7"), ("F5:H5", "F6:H7"), ("J5:L5", "J6:L7"), ("N5:P5", "N6:P7")]
+    for (label, value, kind), (label_rng, value_rng) in zip(kpis, kpi_blocks):
+        forward_ws.merge_range(label_rng, label, kpi_label_fmt)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            display = "-"
+        elif kind == "count":
+            display = str(int(value))
+        elif kind == "multiple":
+            display = f"{value:.1f}x"
+        else:
+            display = f"{value:.0%}"
+        forward_ws.merge_range(value_rng, display, kpi_value_fmt)
+
+    forward_ws.merge_range("B9:J9", "Forward PE Cross-Section", section_header_fmt)
+
+    table_headers = [
+        "ETF", "Current", "1Y Avg", "1Y Low", "1Y High",
+        "Premium/(Discount)", "Percentile", "Coverage", "Obs.", "Status"
+    ]
+    table_row = 9  # zero-based row 10
+    for col, header in enumerate(table_headers, start=1):
+        forward_ws.write(table_row, col, header, table_header_fmt)
+
+    if not stats.empty:
+        stats_display = stats.sort_values("Premium/(Discount)", ascending=False, na_position="last").reset_index(drop=True)
+        for i, row in stats_display.iterrows():
+            r = table_row + 1 + i
+            forward_ws.write(r, 1, row["ETF"], table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 2, row["Current Forward PE"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 3, row["1Y Avg"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 4, row["1Y Low"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 5, row["1Y High"], table_num_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 6, row["Premium/(Discount)"], table_pct_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 7, row["History Percentile"], table_pct_fmt, table_text_fmt)
+            _write_number_or_dash(forward_ws, r, 8, row["Forward PE Coverage"], table_pct_fmt, table_text_fmt)
+            forward_ws.write_number(r, 9, int(row["Observations"]), table_int_fmt)
+            status = row["Status"]
+            status_fmt = status_near_fmt
+            if status == "Above 1Y Avg":
+                status_fmt = status_above_fmt
+            elif status == "Below 1Y Avg":
+                status_fmt = status_below_fmt
+            forward_ws.write(r, 10, status, status_fmt)
+
+        first_data_excel = table_row + 2
+        last_data_excel = table_row + 1 + len(stats_display)
+        forward_ws.conditional_format(
+            f"G{first_data_excel}:G{last_data_excel}",
+            {"type": "3_color_scale", "min_color": "#C6EFCE", "mid_color": "#FFFFFF", "max_color": "#FFC7CE"},
+        )
+        forward_ws.conditional_format(
+            f"H{first_data_excel}:H{last_data_excel}",
+            {"type": "data_bar", "bar_color": "#5B9BD5"},
+        )
+        forward_ws.conditional_format(
+            f"I{first_data_excel}:I{last_data_excel}",
+            {"type": "data_bar", "bar_color": "#70AD47"},
+        )
+
+    charts_start_row = table_row + max(len(stats), 1) + 4
+    forward_ws.merge_range(charts_start_row - 1, 1, charts_start_row - 1, 15, "Forward PE History — Last 1 Year", section_header_fmt)
+
+    for i, etf in enumerate(etf_order):
+        chart_row = charts_start_row + (i // 2) * 17
+        chart_col = 1 + (i % 2) * 8
+        seq_positions = [
+            j + 1
+            for j, (_, row) in enumerate(hist_1y.iterrows())
+            if str(row.get("ETF")) == etf
+        ]
+        if not seq_positions:
+            continue
+
+        first_row = min(seq_positions)
+        last_row = max(seq_positions)
+        etf_stats = stats[stats["ETF"] == etf]
+        current = float(etf_stats.iloc[0]["Current Forward PE"]) if not etf_stats.empty else None
+        avg = float(etf_stats.iloc[0]["1Y Avg"]) if not etf_stats.empty else None
+        chart_title = f"{etf} | {current:.1f}x vs {avg:.1f}x 1Y avg" if current is not None and avg is not None else f"{etf} Forward PE"
+
+        forward_chart = workbook.add_chart({"type": "line"})
+        forward_chart.add_series({
+            "name": "Forward PE",
             "categories": [data_sheet_name, first_row, 0, last_row, 0],
             "values": [data_sheet_name, first_row, 3, last_row, 3],
-            "marker": {"type": "diamond", "size": 4},
+            "line": {"color": "#4472C4", "width": 2.5},
+            "marker": {"type": "circle", "size": 4, "border": {"color": "#4472C4"}, "fill": {"color": "#FFFFFF"}},
         })
-        chart.set_title({"name": f"{etf} PE vs Forward PE"})
-        chart.set_x_axis({"name": "Date", "date_axis": True, "num_format": "mmm yyyy"})
-        chart.set_y_axis({"name": "PE", "major_gridlines": {"visible": True}})
-        chart.set_legend({"position": "bottom"})
-        chart.set_size({"width": 520, "height": 300})
-        worksheet.insert_chart(chart_row, chart_col, chart)
+        forward_chart.add_series({
+            "name": "1Y Average",
+            "categories": [data_sheet_name, first_row, 0, last_row, 0],
+            "values": [data_sheet_name, first_row, 8, last_row, 8],
+            "line": {"color": "#ED7D31", "width": 1.5, "dash_type": "dash"},
+            "marker": {"type": "none"},
+        })
+        forward_chart.add_series({
+            "name": "Latest",
+            "categories": [data_sheet_name, first_row, 0, last_row, 0],
+            "values": [data_sheet_name, first_row, 9, last_row, 9],
+            "line": {"none": True},
+            "marker": {"type": "diamond", "size": 8, "border": {"color": "#C00000"}, "fill": {"color": "#C00000"}},
+            "data_labels": {"value": True, "num_format": '0.0x', "position": "above", "font": {"bold": True, "color": "#C00000"}},
+        })
+        forward_chart.set_title({"name": chart_title, "name_font": {"bold": True, "color": "#0B1F33"}})
+        forward_chart.set_x_axis({
+            "date_axis": True, "num_format": "mmm yy",
+            "line": {"color": "#B4C6E7"},
+            "label_position": "low",
+        })
+        forward_chart.set_y_axis({
+            "name": "Forward PE", "num_format": '0.0x',
+            "major_gridlines": {"visible": True, "line": {"color": "#E7ECF2"}},
+            "line": {"color": "#B4C6E7"},
+        })
+        forward_chart.set_legend({"position": "bottom", "font": {"size": 9}})
+        forward_chart.set_chartarea({"fill": {"color": "#FFFFFF"}, "border": {"color": "#D9E2F3"}})
+        forward_chart.set_plotarea({"fill": {"color": "#FFFFFF"}, "border": {"none": True}})
+        forward_chart.set_size({"width": 560, "height": 300})
+        forward_ws.insert_chart(chart_row, chart_col, forward_chart)
+
+    forward_ws.freeze_panes(table_row + 1, 1)
 
 
 def _make_edge_formats(workbook):
@@ -2676,10 +3061,32 @@ def run_one_etf(etf):
     if etf.upper() == "CHPS":
         etf = "CHPS.TO"
 
+    total_started = time.perf_counter()
+
+    source_started = time.perf_counter()
     holdings = pull_issuer_holdings(etf)
+    source_seconds = time.perf_counter() - source_started
+
+    yahoo_started = time.perf_counter()
     enriched = calculate_returns(add_yahoo_targets(holdings))
+    yahoo_seconds = time.perf_counter() - yahoo_started
+
+    summary_started = time.perf_counter()
     summary = summarize_etf(enriched, etf)
+    validate_yahoo_data_quality(enriched, summary, etf)
+    summary_seconds = time.perf_counter() - summary_started
     print_summary(summary)
+
+    PIPELINE_TIMINGS[etf] = {
+        "source_seconds": source_seconds,
+        "yahoo_seconds": yahoo_seconds,
+        "summary_seconds": summary_seconds,
+        "total_seconds": time.perf_counter() - total_started,
+    }
+    print(
+        f"TIMING {etf}: source={source_seconds:.2f}s, yahoo={yahoo_seconds:.2f}s, "
+        f"summary={summary_seconds:.2f}s, total={PIPELINE_TIMINGS[etf]['total_seconds']:.2f}s"
+    )
 
     output_cols = [
         "ETF", "Yahoo Ticker", "Raw Ticker", "Name", "Weight", "Weight Decimal",
@@ -2698,6 +3105,7 @@ def run_one_etf(etf):
 
 
 def main_with_excel():
+    pipeline_started = time.perf_counter()
     print(f"ETF analyst report version: {REPORT_VERSION}")
 
     all_details = []
@@ -2731,13 +3139,32 @@ def main_with_excel():
         if missing_required:
             print("\nMissing required ETF(s): " + ", ".join(missing_required))
 
-        raise RuntimeError(
+        raise ReportIncompleteError(
             "Report incomplete. No Excel report was exported. "
             "Missing or failed ETF(s): " + ", ".join(missing_required or [f["ETF"] for f in failures])
         )
 
+    report_started = time.perf_counter()
     pe_history = update_pe_history(summaries)
     export_excel_report(all_details, summaries, pe_history=pe_history)
+    report_seconds = time.perf_counter() - report_started
+
+    total_seconds = time.perf_counter() - pipeline_started
+    print("\n" + "=" * 72)
+    print("PIPELINE TIMING SUMMARY")
+    print("=" * 72)
+    for etf in ETFS:
+        timing = PIPELINE_TIMINGS.get(etf)
+        if timing:
+            print(
+                f"{etf}: source={timing['source_seconds']:.2f}s, "
+                f"yahoo={timing['yahoo_seconds']:.2f}s, total={timing['total_seconds']:.2f}s"
+            )
+    if YAHOO_FETCH_TIMINGS:
+        slowest = sorted(YAHOO_FETCH_TIMINGS.items(), key=lambda x: x[1], reverse=True)[:10]
+        print("Slowest Yahoo symbols: " + ", ".join(f"{s}={secs:.1f}s" for s, secs in slowest))
+    print(f"Excel/history export: {report_seconds:.2f}s")
+    print(f"TOTAL PIPELINE: {total_seconds:.2f}s")
 
     return all_details, summaries, failures
 

@@ -34,13 +34,20 @@ def env_required(name: str) -> str:
 
 
 def find_latest_report(report_dir: Path) -> Path:
+    canonical = report_dir / "ETF_analyst_report.xlsx"
+    if canonical.exists():
+        return canonical
+
     candidates = sorted(
-        list(report_dir.glob("*.xlsx")) + list(report_dir.glob("*.xlsm")),
+        list(report_dir.glob("ETF_analyst_report_*.xlsx"))
+        + list(report_dir.glob("ETF_analyst_report_*.xlsm")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     if not candidates:
-        raise FileNotFoundError(f"No Excel report found in: {report_dir.resolve()}")
+        raise FileNotFoundError(
+            f"No ETF analyst report found in: {report_dir.resolve()}"
+        )
     return candidates[0]
 
 
