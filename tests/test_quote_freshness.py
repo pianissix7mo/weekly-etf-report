@@ -259,3 +259,15 @@ def test_foreign_major_weight_cannot_pass_with_partial_day_quote(monkeypatch):
     }
     with pytest.raises(ReportIncompleteError, match="freshness"):
         pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
+
+
+def test_asian_ytd_excludes_newer_incomplete_daily_bar(monkeypatch):
+    history = pd.Series(
+        [100.0, 145.0, 160.0],
+        index=pd.to_datetime(["2025-12-31", "2026-11-10", "2026-11-11"]),
+    )
+    monkeypatch.setattr(pipeline, "_download_adjusted_close", lambda *a, **kw: history)
+    actual = pipeline.get_ytd_return_from_yahoo(
+        "005930.KS", verified_price=150.0, verified_quote_date="2026-11-10"
+    )
+    assert actual == pytest.approx(0.50)
