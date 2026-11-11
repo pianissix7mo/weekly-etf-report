@@ -1,0 +1,33 @@
+name: ETF quote fallback smoke test
+on:
+  push:
+    branches: [main]
+    paths:
+      - etf_report/prices.py
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install 'pandas>=2.2,<3' 'yfinance>=0.2,<1' requests beautifulsoup4
+      - name: Verify same-day backup closing prices
+        run: |
+          python - <<'PY'
+          from etf_report.prices import expected_us_close_date, fetch_public_dated_close
+          print("EXPECTED", expected_us_close_date(), flush=True)
+          errors = []
+          for symbol in ("NVDA", "META", "GOOG", "QQQ", "PANW", "SNDK"):
+              price, session = fetch_public_dated_close(symbol, expected_us_close_date())
+              print(f"RESULT {symbol} {session} {price}", flush=True)
+              if session != expected_us_close_date() or price is None:
+                  errors.append(symbol)
+          if errors:
+              raise RuntimeError("Missing verified backup quote: " + ", ".join(errors))
+          PY
