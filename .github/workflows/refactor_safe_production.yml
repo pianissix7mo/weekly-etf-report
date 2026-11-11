@@ -2,9 +2,6 @@ name: ETF Analyst Report - Production
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ['tests/test_quote_freshness.py']
   schedule:
     - cron: "15 16 * * 1-5"
       timezone: "America/Toronto"
