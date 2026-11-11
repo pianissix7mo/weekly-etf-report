@@ -53,6 +53,14 @@ jobs:
           else
             git commit -m "Update ETF PE history (manual)"
             git fetch origin main
+            # A run must never email a workbook built from an older code
+            # revision when calculation/quote-fetching code changed mid-run.
+            if ! git diff --quiet HEAD origin/main -- \
+              etf_analyst_report_complete.py etf_report/ \
+              send_etf_report_email.py requirements.txt; then
+              echo "ETF source code changed during the run; refuse stale-code report" >&2
+              exit 1
+            fi
             git rebase origin/main
             git push origin HEAD:main
           fi
