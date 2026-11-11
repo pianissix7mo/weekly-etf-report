@@ -138,17 +138,18 @@ def test_ytd_uses_verified_closing_price_when_adjusted_history_lags(monkeypatch)
     assert ytd == pytest.approx(0.6889)
 
 
-def test_ytd_does_not_overwrite_newer_history_with_older_quote(monkeypatch):
-    dates = pd.to_datetime(["2025-12-31", "2026-11-10"])
-    fresh_history = pd.Series([100.0, 110.0], index=dates)
+def test_ytd_does_not_use_history_after_verified_close_date(monkeypatch):
+    dates = pd.to_datetime(["2025-12-31", "2026-11-09", "2026-11-10"])
+    history_with_partial_next_day = pd.Series([100.0, 105.0, 110.0], index=dates)
     monkeypatch.setattr(
         pipeline, "_download_adjusted_close",
-        lambda *args, **kwargs: fresh_history,
+        lambda *args, **kwargs: history_with_partial_next_day,
     )
     ytd = pipeline.get_ytd_return_from_yahoo(
         "NVDA", verified_price=105.0, verified_quote_date="2026-11-09"
     )
-    assert ytd == pytest.approx(0.10)
+    # Never include the newer but unverified quote in close-to-close YTD.
+    assert ytd == pytest.approx(0.05)
 
 
 def test_stale_valid_quote_is_not_cached_between_etfs(monkeypatch):
