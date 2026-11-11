@@ -62,7 +62,7 @@ def fetch_dated_close(ticker, symbol, now=None):
     required = expected_us_close_date(now) if is_us_quote(symbol) else None
     choices = []
     try:
-        hist = ticker.history(period="7d", interval="1d", auto_adjust=False, actions=False)
+        hist = ticker.history(period="5d", interval="1d", auto_adjust=False, actions=False)
         price, session = parse_dated_close(hist)
         if price is not None:
             choices.append((session, price))
@@ -73,7 +73,7 @@ def fetch_dated_close(ticker, symbol, now=None):
 
     try:
         hist = yf.download(
-            symbol, period="7d", interval="1d", auto_adjust=False,
+            symbol, period="5d", interval="1d", auto_adjust=False,
             progress=False, threads=False,
         )
         price, session = parse_dated_close(hist)
