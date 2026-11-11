@@ -59,7 +59,7 @@ from etf_report.errors import (
     SourceSchemaChangedError,
 )
 from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_name_to_yahoo, map_to_yahoo_symbol
-from etf_report.prices import expected_us_close_date, fetch_dated_close, is_us_quote
+from etf_report.prices import expected_completed_session_date, expected_us_close_date, fetch_dated_close, is_us_quote
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1588,10 +1588,11 @@ def pull_yahoo_targets(symbol):
         # reuse the previous close after today's market has finished trading.
         # Use exchange-dated unadjusted daily candles, with a second Yahoo path.
         out["Current Price"], out["Price Date"] = fetch_dated_close(t, symbol)
-        if is_us_quote(symbol) and out["Price Date"] != expected_us_close_date():
+        completed_session = expected_completed_session_date(symbol)
+        if completed_session and out["Price Date"] != completed_session:
             print(
                 f"STALE QUOTE {symbol}: price={out['Current Price']} "
-                f"as-of={out['Price Date']} expected={expected_us_close_date()}"
+                f"as-of={out['Price Date']} expected={completed_session}"
             )
 
         try:
@@ -1666,9 +1667,10 @@ def _yahoo_row_cacheable(row):
     if "target error:" in error.lower():
         return False
     symbol = str(row.get("Yahoo Ticker") or "")
-    if is_us_quote(symbol) and str(row.get("Price Date") or "") != expected_us_close_date():
-        # A dated yesterday-price may be replaced by a fresh quote on the
-        # next ETF. Never reuse the old day across the entire report.
+    expected = expected_completed_session_date(symbol)
+    if expected and str(row.get("Price Date") or "") != expected:
+        # A stale or still-open daily candle should never propagate across
+        # the ETFs and prevent a later retry from obtaining the completed bar.
         return False
     return True
 
@@ -1803,19 +1805,19 @@ def validate_yahoo_data_quality(df, summary, etf):
     # Freshness is a weighted gate, not just a non-null price coverage check.
     # Before the fix, yesterday's NVDA price passed with 100% coverage.
     if "Yahoo Ticker" in df.columns and "Price Date" in df.columns:
-        required = expected_us_close_date()
-        us_quotes = df["Yahoo Ticker"].fillna("").astype(str).map(is_us_quote)
+        required = df["Yahoo Ticker"].fillna("").astype(str).map(expected_completed_session_date)
+        checked_quotes = required.notna()
         as_of = df["Price Date"].fillna("").astype(str)
-        stale = us_quotes & prices.notna() & (as_of != required)
+        stale = checked_quotes & prices.notna() & (as_of != required)
         stale_weight = float(weights[stale].sum() / total_weight)
         if stale_weight > 0.005:
             sample = df.loc[stale, ["Yahoo Ticker", "Price Date"]].head(8).to_dict("records")
             failures.append(
-                f"dated US quote freshness failed: stale portfolio weight "
-                f"{stale_weight:.1%} > 0.5%; expected={required}; examples={sample}"
+                f"exchange-dated close freshness failed: stale portfolio weight "
+                f"{stale_weight:.1%} > 0.5%; examples={sample}"
             )
         core = {"NVDA", "AAPL", "MSFT", "AMZN", "META", "AMD", "MU", "AVGO", "TSLA"}
-        key_quotes = us_quotes & df["Yahoo Ticker"].astype(str).isin(core) & (weights >= 0.02)
+        key_quotes = checked_quotes & df["Yahoo Ticker"].astype(str).isin(core) & (weights >= 0.02)
         missing_fresh_key = key_quotes & (prices.isna() | (as_of != required))
         if missing_fresh_key.any():
             missing = df.loc[missing_fresh_key, "Yahoo Ticker"].astype(str).tolist()
@@ -1854,10 +1856,11 @@ def validate_yahoo_data_quality(df, summary, etf):
 
 def get_etf_current_price(etf):
     price, quote_date = fetch_dated_close(yf.Ticker(etf), etf)
-    if is_us_quote(etf) and quote_date != expected_us_close_date():
+    expected = expected_completed_session_date(etf)
+    if expected and quote_date != expected:
         raise ReportIncompleteError(
             f"{etf}: ETF quote stale/missing: {quote_date}; "
-            f"expected {expected_us_close_date()}. Refusing stale ETF price."
+            f"expected {expected}. Refusing stale ETF price."
         )
     return price
 
@@ -1868,7 +1871,7 @@ def summarize_etf(df, etf):
     fpe, fpe_cov = weighted_forward_pe(df)
     return {"ETF": etf, "Total Holdings Used": len(df), "Covered Holdings": len(covered), "Total Weight Used": df["Weight Decimal"].sum(), "Covered Weight": covered["Weight Decimal"].sum(), "ETF YTD Return": get_ytd_return_from_yahoo(
         etf, verified_price=get_etf_current_price(etf),
-        verified_quote_date=expected_us_close_date() if is_us_quote(etf) else None,
+        verified_quote_date=expected_completed_session_date(etf),
     ), "Raw Worst Case Return": covered["Weighted Low Return"].sum(), "Raw Mean Case Return": covered["Weighted Mean Return"].sum(), "Raw Best Case Return": covered["Weighted High Return"].sum(), "Raw Median Case Return": covered["Weighted Median Return"].sum(), "PE Ratio": pe_ratio, "PE Coverage Weight": pe_cov, "Forward PE": fpe, "Forward PE Coverage Weight": fpe_cov}
 
 
@@ -3123,11 +3126,10 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         audit.set_column("C:C", 17)
         audit.set_column("D:E", 20)
         audit.set_column("F:F", 21)
-        audit_headers = ["ETF", "Ticker", "Unadjusted Close", "Quote Session", "Required US Session", "Status"]
+        audit_headers = ["ETF", "Ticker", "Unadjusted Close", "Quote Session", "Required Session", "Status"]
         for column, heading in enumerate(audit_headers):
             audit.write(0, column, heading, header_fmt)
         audit_row = 1
-        us_required = expected_us_close_date()
         for details in all_details:
             if details is None or details.empty:
                 continue
@@ -3137,7 +3139,7 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                 price = safe_float_value(holding.get("Current Price"))
                 quote_date = holding.get("Price Date")
                 quote_date = "" if pd.isna(quote_date) else str(quote_date)
-                required = us_required if is_us_quote(ticker) else ""
+                required = expected_completed_session_date(ticker) or ""
                 yahoo_error = str(holding.get("Yahoo Error") or "")
                 if price is None and yahoo_error.startswith("preflight skipped:"):
                     status = "SKIPPED NON-EQUITY"
@@ -3153,7 +3155,7 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                 audit.write(audit_row, 4, required)
                 audit.write(audit_row, 5, status)
                 audit_row += 1
-        print(f"Quote audit: {audit_row - 1} dated rows; required US close={us_required}")
+        print(f"Quote audit: {audit_row - 1} rows with exchange-local completed-session checks")
 
         # ---------------- ETF Overlap sheet ----------------
         _write_etf_overlap_sheet(workbook, writer, all_details, etf_sheet_map)
