@@ -6,6 +6,12 @@ on:
     - cron: "15 16 * * 1-5"
       timezone: "America/Toronto"
 
+# Share a serialization lock with the legacy manual workflow. Two runs may
+# otherwise try to push different versions of the binary PE history workbook.
+concurrency:
+  group: etf-analyst-history-writer
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -42,14 +48,22 @@ jobs:
           retry_wait_seconds: 60
           command: python etf_analyst_report_complete.py
 
-      - name: Commit main PE history
+      - name: Commit main PE history (fail on conflict)
         run: |
+          set -euo pipefail
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add etf_analyst_target_outputs/ETF_PE_history.xlsx
-          git commit -m "Update ETF PE history" || echo "No PE history changes to commit"
-          git pull --rebase origin main || true
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "PE history unchanged; nothing to commit"
+          else
+            git commit -m "Update ETF PE history"
+            # Never swallow a binary workbook rebase conflict. If this fails,
+            # the job must fail BEFORE artifact upload and email sending.
+            git fetch origin main
+            git rebase origin/main
+            git push origin HEAD:main
+          fi
 
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
