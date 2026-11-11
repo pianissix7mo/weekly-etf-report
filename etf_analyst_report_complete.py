@@ -3073,6 +3073,41 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
             ws.set_column("T:V", 11)
             ws.set_default_row(18)
 
+        # ---------------- Dated quote audit (do not label an old close as today's) ----------------
+        audit = workbook.add_worksheet("Price_Audit")
+        writer.sheets["Price_Audit"] = audit
+        audit.freeze_panes(1, 0)
+        audit.set_column("A:A", 13)
+        audit.set_column("B:B", 17)
+        audit.set_column("C:C", 17)
+        audit.set_column("D:E", 20)
+        audit.set_column("F:F", 21)
+        audit_headers = ["ETF", "Ticker", "Unadjusted Close", "Quote Session", "Required US Session", "Status"]
+        for column, heading in enumerate(audit_headers):
+            audit.write(0, column, heading, header_fmt)
+        audit_row = 1
+        us_required = expected_us_close_date()
+        for details in all_details:
+            if details is None or details.empty:
+                continue
+            for _, holding in details.iterrows():
+                etf_name = str(holding.get("ETF", ""))
+                ticker = str(holding.get("Yahoo Ticker", ""))
+                price = safe_float_value(holding.get("Current Price"))
+                quote_date = holding.get("Price Date")
+                quote_date = "" if pd.isna(quote_date) else str(quote_date)
+                required = us_required if is_us_quote(ticker) else ""
+                status = ("OK" if quote_date == required and price is not None else "STALE/MISSING") if required else "NON-US"
+                audit.write(audit_row, 0, etf_name)
+                audit.write(audit_row, 1, ticker)
+                if price is not None:
+                    audit.write_number(audit_row, 2, float(price))
+                audit.write(audit_row, 3, quote_date)
+                audit.write(audit_row, 4, required)
+                audit.write(audit_row, 5, status)
+                audit_row += 1
+        print(f"Quote audit: {audit_row - 1} dated rows; required US close={us_required}")
+
         # ---------------- ETF Overlap sheet ----------------
         _write_etf_overlap_sheet(workbook, writer, all_details, etf_sheet_map)
 
