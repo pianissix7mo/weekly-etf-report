@@ -1,6 +1,6 @@
 """
 Email the latest ETF analyst report Excel file produced by:
-    etf_analyst_report_LAST_WORKING_PLUS_INVESCO_BROWSER.py
+    etf_analyst_report_complete.py
 
 Required environment variables:
     SMTP_HOST       example: smtp.gmail.com
@@ -99,7 +99,7 @@ def send_email_with_attachment(report_path: Path) -> None:
     msg["To"] = ", ".join(recipients)
     msg.set_content(
         "Hi,\n\n"
-        "Attached is the latest weekly ETF analyst target report.\n\n"
+        "Attached is the latest daily ETF analyst target report.\n\n"
         f"File: {report_path.name}\n\n"
         "This email was sent automatically by GitHub Actions.\n"
     )
