@@ -1161,8 +1161,12 @@ YAHOO_FETCH_TIMINGS = {}
 PIPELINE_TIMINGS = {}
 
 
-def get_ytd_return_from_yahoo(symbol):
-    """Calendar YTD total return using the previous year-end adjusted close."""
+def get_ytd_return_from_yahoo(symbol, verified_price=None, verified_quote_date=None):
+    """Calendar YTD return from last year-end adjusted close to a dated close.
+
+    The Yahoo adjusted history endpoint can stop at yesterday while the
+    independently verified daily closing price is already available today.
+    """
     try:
         today = pd.Timestamp.now(tz="America/Toronto").tz_localize(None)
     except Exception:
@@ -1180,6 +1184,17 @@ def get_ytd_return_from_yahoo(symbol):
             return None
         first_close = safe_float_value(baseline.iloc[-1])
         last_close = safe_float_value(current_year.iloc[-1])
+        last_history_date = pd.Timestamp(current_year.index[-1]).strftime("%Y-%m-%d")
+        confirmed_price = safe_float_value(verified_price)
+        if (
+            confirmed_price is not None and confirmed_price > 0
+            and verified_quote_date is not None
+            and str(verified_quote_date) >= last_history_date
+        ):
+            # At the current endpoint of an adjusted series, unadjusted close
+            # is on the same split basis; adjusted year-end baseline captures
+            # intervening dividends for total return.
+            last_close = confirmed_price
         if first_close in [None, 0] or last_close is None:
             return None
         return float(last_close / first_close - 1)
@@ -1603,7 +1618,10 @@ def pull_yahoo_targets(symbol):
             out["Trailing PE"] = trailing_pe
             out["Forward PE"] = forward_pe
 
-        out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
+        out["YTD Return"] = get_ytd_return_from_yahoo(
+            symbol, verified_price=out["Current Price"],
+            verified_quote_date=out["Price Date"],
+        )
 
         try:
             # Reuse the info payload above instead of fetching quoteSummary twice.
@@ -1828,7 +1846,10 @@ def summarize_etf(df, etf):
     covered = df.dropna(subset=["Current Price", "Target Low", "Target Mean", "Target High"]).copy()
     pe_ratio, pe_cov = weighted_harmonic_pe(df)
     fpe, fpe_cov = weighted_forward_pe(df)
-    return {"ETF": etf, "Total Holdings Used": len(df), "Covered Holdings": len(covered), "Total Weight Used": df["Weight Decimal"].sum(), "Covered Weight": covered["Weight Decimal"].sum(), "ETF YTD Return": get_ytd_return_from_yahoo(etf), "Raw Worst Case Return": covered["Weighted Low Return"].sum(), "Raw Mean Case Return": covered["Weighted Mean Return"].sum(), "Raw Best Case Return": covered["Weighted High Return"].sum(), "Raw Median Case Return": covered["Weighted Median Return"].sum(), "PE Ratio": pe_ratio, "PE Coverage Weight": pe_cov, "Forward PE": fpe, "Forward PE Coverage Weight": fpe_cov}
+    return {"ETF": etf, "Total Holdings Used": len(df), "Covered Holdings": len(covered), "Total Weight Used": df["Weight Decimal"].sum(), "Covered Weight": covered["Weight Decimal"].sum(), "ETF YTD Return": get_ytd_return_from_yahoo(
+        etf, verified_price=get_etf_current_price(etf),
+        verified_quote_date=expected_us_close_date() if is_us_quote(etf) else None,
+    ), "Raw Worst Case Return": covered["Weighted Low Return"].sum(), "Raw Mean Case Return": covered["Weighted Mean Return"].sum(), "Raw Best Case Return": covered["Weighted High Return"].sum(), "Raw Median Case Return": covered["Weighted Median Return"].sum(), "PE Ratio": pe_ratio, "PE Coverage Weight": pe_cov, "Forward PE": fpe, "Forward PE Coverage Weight": fpe_cov}
 
 
 def print_summary(s):
