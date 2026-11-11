@@ -149,3 +149,50 @@ def test_ytd_does_not_overwrite_newer_history_with_older_quote(monkeypatch):
         "NVDA", verified_price=105.0, verified_quote_date="2026-11-09"
     )
     assert ytd == pytest.approx(0.10)
+
+
+def test_stale_valid_quote_is_not_cached_between_etfs(monkeypatch):
+    monkeypatch.setattr(pipeline, "expected_us_close_date", lambda: "2026-11-10")
+    stale = pipeline._empty_yahoo_row("NVDA")
+    stale.update({
+        "Current Price": 178.67,
+        "Price Date": "2026-11-09",
+        "Target Low": 100,
+        "Target Mean": 200,
+        "Target High": 300,
+    })
+    assert not pipeline._yahoo_row_cacheable(stale)
+    stale["Price Date"] = "2026-11-10"
+    assert pipeline._yahoo_row_cacheable(stale)
+
+
+def test_real_etf_rejects_missing_price_date_metadata():
+    df = pd.DataFrame({
+        "Yahoo Ticker": ["NVDA"],
+        "Weight Decimal": [1.0],
+        "Current Price": [168.89],
+    })
+    summary = {
+        "Covered Weight": 1.0,
+        "PE Coverage Weight": 1.0,
+        "Forward PE Coverage Weight": 1.0,
+    }
+    with pytest.raises(ReportIncompleteError, match="mandatory price date"):
+        pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
+
+
+def test_real_etf_rejects_collapsed_analyst_coverage(monkeypatch):
+    monkeypatch.setattr(pipeline, "expected_us_close_date", lambda: "2026-11-10")
+    df = pd.DataFrame({
+        "Yahoo Ticker": ["NVDA", "AAPL"],
+        "Weight Decimal": [0.50, 0.50],
+        "Current Price": [168.89, 348.51],
+        "Price Date": ["2026-11-10", "2026-11-10"],
+    })
+    summary = {
+        "Covered Weight": 0.10,
+        "PE Coverage Weight": 1.0,
+        "Forward PE Coverage Weight": 1.0,
+    }
+    with pytest.raises(ReportIncompleteError, match="analyst-target coverage"):
+        pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
