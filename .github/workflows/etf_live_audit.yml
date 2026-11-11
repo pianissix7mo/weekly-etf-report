@@ -7,6 +7,11 @@ on:
     paths:
       - '.github/workflows/etf_live_audit.yml'
 
+# Isolated audit runs neither email nor commit PE history.
+concurrency:
+  group: etf-live-audit-only
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
