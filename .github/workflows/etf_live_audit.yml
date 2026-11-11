@@ -1,0 +1,38 @@
+name: ETF Live Data Audit (No Email)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/etf_live_audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Audit complete ETF report without sending or committing
+        run: python etf_analyst_report_complete.py
+      - name: Publish audit-only workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: ETF-live-audit-only
+          path: etf_analyst_target_outputs/ETF_analyst_report.xlsx
+          retention-days: 7
