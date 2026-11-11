@@ -123,3 +123,29 @@ def test_backup_dated_close_used_only_when_yahoo_daily_bar_is_stale(monkeypatch)
     assert value == pytest.approx(168.89)
     assert quoted == "2026-11-10"
     assert backup_calls == [("NVDA", "2026-11-10")]
+
+
+def test_ytd_uses_verified_closing_price_when_adjusted_history_lags(monkeypatch):
+    dates = pd.to_datetime(["2025-12-31", "2026-11-09"])
+    stale_history = pd.Series([100.0, 105.0], index=dates)
+    monkeypatch.setattr(
+        pipeline, "_download_adjusted_close",
+        lambda *args, **kwargs: stale_history,
+    )
+    ytd = pipeline.get_ytd_return_from_yahoo(
+        "NVDA", verified_price=168.89, verified_quote_date="2026-11-10"
+    )
+    assert ytd == pytest.approx(0.6889)
+
+
+def test_ytd_does_not_overwrite_newer_history_with_older_quote(monkeypatch):
+    dates = pd.to_datetime(["2025-12-31", "2026-11-10"])
+    fresh_history = pd.Series([100.0, 110.0], index=dates)
+    monkeypatch.setattr(
+        pipeline, "_download_adjusted_close",
+        lambda *args, **kwargs: fresh_history,
+    )
+    ytd = pipeline.get_ytd_return_from_yahoo(
+        "NVDA", verified_price=105.0, verified_quote_date="2026-11-09"
+    )
+    assert ytd == pytest.approx(0.10)
