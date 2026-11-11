@@ -82,7 +82,7 @@ def _parse_history_html_close(html, required):
             if pd.isna(parsed) or pd.Timestamp(parsed).strftime("%Y-%m-%d") != required:
                 continue
             close_text = cells[close_col].get_text(" ", strip=True)
-            match = re.search(r"[-+]?(?:\\d{1,3}(?:,\\d{3})*|\\d+)\\.\\d+", close_text)
+            match = re.search(r"[-+]?(?:\d{1,3}(?:,\d{3})*|\d+)\.\d+", close_text)
             if match:
                 value = float(match.group().replace(",", ""))
                 if 0 < value < 10_000_000:
