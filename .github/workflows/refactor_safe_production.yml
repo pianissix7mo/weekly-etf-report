@@ -73,6 +73,7 @@ jobs:
             etf_analyst_target_outputs/ETF_analyst_report.xlsx
             etf_analyst_target_outputs/ETF_PE_history.xlsx
             etf_analyst_target_outputs/ETF_analyst_report_*.xlsx
+          if-no-files-found: error
           retention-days: 30
 
       - name: Send ETF report email
