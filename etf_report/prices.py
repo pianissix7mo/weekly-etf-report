@@ -16,26 +16,58 @@ def is_us_quote(symbol):
     return bool(re.fullmatch(r"[A-Z]{1,6}(?:-[A-Z])?", str(symbol).upper()))
 
 
-def expected_us_close_date(now=None):
-    """Last completed US weekday session (fail closed on market holidays).
+# Quote times use the exchange's local clock, not the report runner's clock.
+# Add a few minutes after the official close for price data providers to settle.
+# The weekday expectation intentionally fails closed on an exchange holiday;
+# a holiday should not be mislabeled as a completed trading session.
+_MARKETS = {
+    ".TO": ("America/Toronto", (16, 5)),
+    ".TW": ("Asia/Taipei", (13, 40)),
+    ".KS": ("Asia/Seoul", (15, 40)),
+    ".T": ("Asia/Tokyo", (15, 40)),
+    ".HK": ("Asia/Hong_Kong", (16, 10)),
+    ".AS": ("Europe/Amsterdam", (17, 40)),
+    ".DE": ("Europe/Berlin", (17, 40)),
+    ".SW": ("Europe/Zurich", (17, 40)),
+    ".PA": ("Europe/Paris", (17, 40)),
+    ".L": ("Europe/London", (16, 40)),
+}
 
-    NYSE holidays during a weekday intentionally produce no fresh quote and
-    therefore no publication, rather than accepting yesterday's data.
+
+def expected_completed_session_date(symbol, now=None):
+    """Date of the most recent *completed* regular session for this listing.
+
+    Returns None for unknown markets rather than pretending to validate them.
     """
-    moment = pd.Timestamp.now(tz="America/New_York") if now is None else pd.Timestamp(now)
+    name = str(symbol).upper().strip()
+    market = next(
+        (spec for suffix, spec in _MARKETS.items() if name.endswith(suffix)),
+        None,
+    )
+    if market is None:
+        if not is_us_quote(name):
+            return None
+        market = ("America/New_York", (16, 5))
+    timezone, close_clock = market
+    moment = pd.Timestamp.now(tz=timezone) if now is None else pd.Timestamp(now)
     if moment.tzinfo is None:
-        moment = moment.tz_localize("America/New_York")
+        moment = moment.tz_localize(timezone)
     else:
-        moment = moment.tz_convert("America/New_York")
-    cutoff_reached = (moment.hour, moment.minute) >= (16, 5)
-    if moment.weekday() < 5 and cutoff_reached:
+        moment = moment.tz_convert(timezone)
+
+    if moment.weekday() < 5 and (moment.hour, moment.minute) >= close_clock:
         return moment.strftime("%Y-%m-%d")
     previous = moment.normalize() - pd.offsets.BDay(1)
     return previous.strftime("%Y-%m-%d")
 
 
-def parse_dated_close(history):
-    """Read the last non-null unadjusted Close and its exchange-local date."""
+def expected_us_close_date(now=None):
+    """Backwards-compatible US session helper."""
+    return expected_completed_session_date("NVDA", now=now)
+
+
+def parse_dated_close(history, required=None):
+    """Select the completed session's unadjusted Close, never a partial candle."""
     if history is None or history.empty:
         return None, None
     if isinstance(history.columns, pd.MultiIndex):
@@ -49,6 +81,15 @@ def parse_dated_close(history):
         close = history["Close"]
     close = pd.to_numeric(close, errors="coerce").dropna()
     close = close[close > 0]
+    if required is not None:
+        completed_rows = [
+            idx for idx in close.index
+            if pd.Timestamp(idx).strftime("%Y-%m-%d") == required
+        ]
+        if not completed_rows:
+            return None, None
+        last_idx = completed_rows[-1]
+        return float(close.loc[last_idx]), required
     if close.empty:
         return None, None
     session = pd.Timestamp(close.index[-1]).strftime("%Y-%m-%d")
@@ -128,15 +169,16 @@ def fetch_dated_close(ticker, symbol, now=None):
     Returns (price, session_date). A stale result is returned with its actual date,
     so downstream quality gates can refuse the workbook.
     """
-    required = expected_us_close_date(now) if is_us_quote(symbol) else None
+    required = expected_completed_session_date(symbol, now=now)
     choices = []
     try:
         hist = ticker.history(period="5d", interval="1d", auto_adjust=False, actions=False)
+        price, session = parse_dated_close(hist, required=required)
+        if price is not None:
+            return price, session
         price, session = parse_dated_close(hist)
         if price is not None:
             choices.append((session, price))
-            if required is None or session >= required:
-                return price, session
     except Exception:
         pass
 
@@ -145,13 +187,17 @@ def fetch_dated_close(ticker, symbol, now=None):
             symbol, period="5d", interval="1d", auto_adjust=False,
             progress=False, threads=False,
         )
+        price, session = parse_dated_close(hist, required=required)
+        if price is not None:
+            return price, session
         price, session = parse_dated_close(hist)
         if price is not None:
             choices.append((session, price))
     except Exception:
         pass
 
-    if required is not None and not any(date >= required for date, _ in choices):
+    # The independent public-history fallback presently supports US listings.
+    if required is not None and is_us_quote(symbol):
         backup_price, backup_date = fetch_public_dated_close(symbol, required)
         if backup_price is not None and backup_date == required:
             return backup_price, backup_date
