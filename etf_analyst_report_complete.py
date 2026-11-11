@@ -59,6 +59,7 @@ from etf_report.errors import (
     SourceSchemaChangedError,
 )
 from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_name_to_yahoo, map_to_yahoo_symbol
+from etf_report.prices import expected_us_close_date, fetch_dated_close, is_us_quote
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1525,6 +1526,7 @@ def _empty_yahoo_row(symbol, error=None):
     return {
         "Yahoo Ticker": symbol,
         "Current Price": None,
+        "Price Date": None,
         "Target Low": None,
         "Target Mean": None,
         "Target High": None,
@@ -1567,19 +1569,15 @@ def pull_yahoo_targets(symbol):
         except Exception as e:
             out["Yahoo Error"] = f"target error: {e}"
 
-        try:
-            fast = t.fast_info
-            out["Current Price"] = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        except Exception:
-            pass
-
-        if out["Current Price"] is None or pd.isna(out["Current Price"]):
-            try:
-                hist = t.history(period="5d", auto_adjust=False)
-                if hist is not None and not hist.empty:
-                    out["Current Price"] = hist["Close"].dropna().iloc[-1]
-            except Exception:
-                pass
+        # fast_info.last_price has no reliable session date and can silently
+        # reuse the previous close after today's market has finished trading.
+        # Use exchange-dated unadjusted daily candles, with a second Yahoo path.
+        out["Current Price"], out["Price Date"] = fetch_dated_close(t, symbol)
+        if is_us_quote(symbol) and out["Price Date"] != expected_us_close_date():
+            print(
+                f"STALE QUOTE {symbol}: price={out['Current Price']} "
+                f"as-of={out['Price Date']} expected={expected_us_close_date()}"
+            )
 
         try:
             info = t.get_info()
@@ -1590,8 +1588,20 @@ def pull_yahoo_targets(symbol):
                 info = {}
 
         if isinstance(info, dict):
-            out["Trailing PE"] = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
-            out["Forward PE"] = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
+            trailing_pe = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
+            forward_pe = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
+            # Quote-summary valuation ratios may be from an earlier session.
+            # Rebase ratios using their reference quote when it is available.
+            reference_price = safe_float_value(info.get("currentPrice"))
+            if reference_price is None or reference_price <= 0:
+                reference_price = safe_float_value(info.get("regularMarketPrice"))
+            verified_price = safe_float_value(out["Current Price"])
+            if reference_price and verified_price and reference_price > 0:
+                factor = verified_price / reference_price
+                trailing_pe = trailing_pe * factor if trailing_pe is not None else None
+                forward_pe = forward_pe * factor if forward_pe is not None else None
+            out["Trailing PE"] = trailing_pe
+            out["Forward PE"] = forward_pe
 
         out["YTD Return"] = get_ytd_return_from_yahoo(symbol)
 
@@ -1752,6 +1762,26 @@ def validate_yahoo_data_quality(df, summary, etf):
     forward_pe_coverage = float(forward_pe_weight / total_weight)
 
     failures = []
+    # Freshness is a weighted gate, not just a non-null price coverage check.
+    # Before the fix, yesterday's NVDA price passed with 100% coverage.
+    if "Yahoo Ticker" in df.columns and "Price Date" in df.columns:
+        required = expected_us_close_date()
+        us_quotes = df["Yahoo Ticker"].fillna("").astype(str).map(is_us_quote)
+        as_of = df["Price Date"].fillna("").astype(str)
+        stale = us_quotes & prices.notna() & (as_of != required)
+        stale_weight = float(weights[stale].sum() / total_weight)
+        if stale_weight > 0.005:
+            sample = df.loc[stale, ["Yahoo Ticker", "Price Date"]].head(8).to_dict("records")
+            failures.append(
+                f"dated US quote freshness failed: stale portfolio weight "
+                f"{stale_weight:.1%} > 0.5%; expected={required}; examples={sample}"
+            )
+        core = {"NVDA", "AAPL", "MSFT", "AMZN", "META", "AMD", "MU", "AVGO", "TSLA"}
+        key_quotes = us_quotes & df["Yahoo Ticker"].astype(str).isin(core) & (weights >= 0.02)
+        missing_fresh_key = key_quotes & (prices.isna() | (as_of != required))
+        if missing_fresh_key.any():
+            missing = df.loc[missing_fresh_key, "Yahoo Ticker"].astype(str).tolist()
+            failures.append(f"major holding missing fresh dated close: {missing}")
     if price_coverage < 0.50:
         failures.append(f"price coverage {price_coverage:.1%} < 50%")
     if target_coverage < 0.05:
@@ -1785,14 +1815,13 @@ def validate_yahoo_data_quality(df, summary, etf):
 # Pure calculation functions live in etf_report.analytics.
 
 def get_etf_current_price(etf):
-    try:
-        t = yf.Ticker(etf); fast = t.fast_info
-        price = fast.get("last_price") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        if price is None or pd.isna(price):
-            hist = t.history(period="5d", auto_adjust=False)
-            if hist is not None and not hist.empty: price = hist["Close"].dropna().iloc[-1]
-        return float(price) if price is not None and not pd.isna(price) else None
-    except Exception: return None
+    price, quote_date = fetch_dated_close(yf.Ticker(etf), etf)
+    if is_us_quote(etf) and quote_date != expected_us_close_date():
+        raise ReportIncompleteError(
+            f"{etf}: ETF quote stale/missing: {quote_date}; "
+            f"expected {expected_us_close_date()}. Refusing stale ETF price."
+        )
+    return price
 
 
 def summarize_etf(df, etf):
