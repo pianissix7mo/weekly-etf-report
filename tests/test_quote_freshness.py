@@ -272,3 +272,25 @@ def test_asian_ytd_excludes_newer_incomplete_daily_bar(monkeypatch):
         "005930.KS", verified_price=150.0, verified_quote_date="2026-11-10"
     )
     assert actual == pytest.approx(0.50)
+
+
+def test_amsterdam_backup_uses_exchange_listing_not_us_ticker_page(monkeypatch):
+    html = (
+        "<table><thead><tr><th>Date</th><th>Close</th></tr></thead>"
+        "<tbody><tr><td>Nov 10, 2026</td><td>150.80</td></tr></tbody></table>"
+    )
+    seen = []
+    class Response:
+        text = html
+        def raise_for_status(self):
+            return None
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        if "finance.yahoo.com" in url:
+            raise RuntimeError("Yahoo unavailable")
+        return Response()
+
+    monkeypatch.setattr(prices.requests, "get", fake_get)
+    result = prices.fetch_public_dated_close("BESI.AS", "2026-11-10")
+    assert result == (150.80, "2026-11-10")
+    assert "https://stockanalysis.com/quote/ams/BESI/history/" in seen
