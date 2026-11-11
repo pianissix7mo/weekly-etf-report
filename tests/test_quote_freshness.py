@@ -53,7 +53,7 @@ def test_stale_primary_candle_retries_second_dated_source(monkeypatch):
 
 
 def test_stale_nvda_cannot_pass_high_coverage_quality_gate(monkeypatch):
-    monkeypatch.setattr(pipeline, "expected_us_close_date", lambda: "2026-11-10")
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
     df = pd.DataFrame({
         "Yahoo Ticker": ["NVDA", "AAPL"],
         "Weight Decimal": [0.08, 0.92],
@@ -75,7 +75,7 @@ def test_stale_nvda_cannot_pass_high_coverage_quality_gate(monkeypatch):
 
 
 def test_core_holding_missing_daily_quote_cannot_silently_pass(monkeypatch):
-    monkeypatch.setattr(pipeline, "expected_us_close_date", lambda: "2026-11-10")
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
     df = pd.DataFrame({
         "Yahoo Ticker": ["NVDA", "AAPL"],
         "Weight Decimal": [0.07, 0.93],
@@ -89,7 +89,7 @@ def test_core_holding_missing_daily_quote_cannot_silently_pass(monkeypatch):
 
 def test_undated_etf_quote_is_not_exported(monkeypatch):
     monkeypatch.setattr(pipeline, "fetch_dated_close", lambda *args: (679.35, "2026-11-09"))
-    monkeypatch.setattr(pipeline, "expected_us_close_date", lambda: "2026-11-10")
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
     monkeypatch.setattr(pipeline.yf, "Ticker", lambda *_: object())
     with pytest.raises(ReportIncompleteError, match="ETF quote stale"):
         pipeline.get_etf_current_price("QQQ")
@@ -152,7 +152,7 @@ def test_ytd_does_not_overwrite_newer_history_with_older_quote(monkeypatch):
 
 
 def test_stale_valid_quote_is_not_cached_between_etfs(monkeypatch):
-    monkeypatch.setattr(pipeline, "expected_us_close_date", lambda: "2026-11-10")
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
     stale = pipeline._empty_yahoo_row("NVDA")
     stale.update({
         "Current Price": 178.67,
@@ -182,7 +182,7 @@ def test_real_etf_rejects_missing_price_date_metadata():
 
 
 def test_real_etf_rejects_collapsed_analyst_coverage(monkeypatch):
-    monkeypatch.setattr(pipeline, "expected_us_close_date", lambda: "2026-11-10")
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
     df = pd.DataFrame({
         "Yahoo Ticker": ["NVDA", "AAPL"],
         "Weight Decimal": [0.50, 0.50],
@@ -195,4 +195,67 @@ def test_real_etf_rejects_collapsed_analyst_coverage(monkeypatch):
         "Forward PE Coverage Weight": 1.0,
     }
     with pytest.raises(ReportIncompleteError, match="analyst-target coverage"):
+        pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
+
+
+
+def test_asian_market_intraday_candle_is_not_treated_as_a_close(monkeypatch):
+    # At 20:20 New York time on Nov 10, Seoul is already Nov 11 morning.
+    assert prices.expected_completed_session_date("005930.KS", RUN_DATE) == "2026-11-10"
+    assert prices.expected_completed_session_date("6857.T", RUN_DATE) == "2026-11-10"
+    assert prices.expected_completed_session_date("2330.TW", RUN_DATE) == "2026-11-10"
+
+    frame = pd.DataFrame(
+        {"Close": [150.0, 155.0]},
+        index=pd.DatetimeIndex([
+            pd.Timestamp("2026-11-10", tz="Asia/Seoul"),
+            pd.Timestamp("2026-11-11", tz="Asia/Seoul"),
+        ]),
+    )
+    class Ticker:
+        def history(self, **kwargs):
+            return frame
+
+    monkeypatch.setattr(prices.yf, "download", lambda *a, **kw: pytest.fail("should use primary"))
+    quote, day = prices.fetch_dated_close(Ticker(), "005930.KS", now=RUN_DATE)
+    assert (quote, day) == (150.0, "2026-11-10")
+
+
+def test_us_stock_intraday_candle_is_not_a_completed_close(monkeypatch):
+    before_close = pd.Timestamp("2026-11-10T15:30:00", tz="America/New_York")
+    frame = pd.concat([bar("2026-11-09", 178.67), bar("2026-11-10", 168.89)])
+    class Ticker:
+        def history(self, **kwargs):
+            return frame
+
+    monkeypatch.setattr(prices.yf, "download", lambda *a, **kw: pytest.fail("should use prior close"))
+    quote, day = prices.fetch_dated_close(Ticker(), "NVDA", now=before_close)
+    assert (quote, day) == (178.67, "2026-11-09")
+
+
+def test_toronto_listed_etf_has_a_close_date_gate(monkeypatch):
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
+    monkeypatch.setattr(pipeline, "fetch_dated_close", lambda *_: (20.0, "2026-11-09"))
+    monkeypatch.setattr(pipeline.yf, "Ticker", lambda *_: object())
+    with pytest.raises(ReportIncompleteError, match="ETF quote stale"):
+        pipeline.get_etf_current_price("TECH.TO")
+
+
+def test_foreign_major_weight_cannot_pass_with_partial_day_quote(monkeypatch):
+    monkeypatch.setattr(
+        pipeline, "expected_completed_session_date",
+        lambda symbol: prices.expected_completed_session_date(symbol, RUN_DATE),
+    )
+    df = pd.DataFrame({
+        "Yahoo Ticker": ["005930.KS", "NVDA"],
+        "Weight Decimal": [0.25, 0.75],
+        "Current Price": [150.0, 168.89],
+        "Price Date": ["2026-11-11", "2026-11-10"],
+    })
+    summary = {
+        "Covered Weight": 1.0,
+        "PE Coverage Weight": 1.0,
+        "Forward PE Coverage Weight": 1.0,
+    }
+    with pytest.raises(ReportIncompleteError, match="freshness"):
         pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
