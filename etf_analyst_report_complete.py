@@ -3154,7 +3154,7 @@ def run_one_etf(etf):
 
     output_cols = [
         "ETF", "Yahoo Ticker", "Raw Ticker", "Name", "Weight", "Weight Decimal",
-        "Current Price", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count",
+        "Current Price", "Price Date", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count",
         "Trailing PE", "Forward PE", "YTD Return",
         "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg",
         "Growth Last Year", "Growth This Year Est", "Growth Next Year Est",
