@@ -35,4 +35,5 @@ jobs:
         with:
           name: ETF-live-audit-only
           path: etf_analyst_target_outputs/ETF_analyst_report.xlsx
+          if-no-files-found: error
           retention-days: 7
