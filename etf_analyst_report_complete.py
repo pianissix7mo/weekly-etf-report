@@ -1180,6 +1180,17 @@ def get_ytd_return_from_yahoo(symbol, verified_price=None, verified_quote_date=N
         close = _download_adjusted_close(symbol, history_start, history_end)
         baseline = close[close.index < year_start]
         current_year = close[close.index >= year_start]
+        if verified_quote_date is not None:
+            # International markets can already have a still-open daily
+            # candle dated tomorrow relative to New York. Never use that
+            # partial candle to compute the report's official close YTD.
+            try:
+                verified_day = pd.Timestamp(verified_quote_date)
+                current_year = current_year[
+                    pd.to_datetime(current_year.index) <= verified_day
+                ]
+            except (ValueError, TypeError):
+                pass
         if baseline.empty or current_year.empty:
             return None
         first_close = safe_float_value(baseline.iloc[-1])
