@@ -1665,6 +1665,11 @@ def _yahoo_row_cacheable(row):
     # propagating one transient Yahoo failure across the whole run.
     if "target error:" in error.lower():
         return False
+    symbol = str(row.get("Yahoo Ticker") or "")
+    if is_us_quote(symbol) and str(row.get("Price Date") or "") != expected_us_close_date():
+        # A dated yesterday-price may be replaced by a fresh quote on the
+        # next ETF. Never reuse the old day across the entire report.
+        return False
     return True
 
 
@@ -1780,6 +1785,21 @@ def validate_yahoo_data_quality(df, summary, etf):
     forward_pe_coverage = float(forward_pe_weight / total_weight)
 
     failures = []
+    production_etf = etf in ETFS
+    if production_etf and not {"Yahoo Ticker", "Price Date"}.issubset(df.columns):
+        failures.append("missing mandatory price date/ticker audit metadata")
+    if production_etf:
+        # A nominal 5% analyst-target or 1% PE coverage could previously
+        # produce a complete-looking yet economically meaningless workbook.
+        if price_coverage < 0.90:
+            failures.append(f"price coverage {price_coverage:.1%} < 90%")
+        if target_coverage < 0.75:
+            failures.append(f"analyst-target coverage {target_coverage:.1%} < 75%")
+        if max(pe_coverage, forward_pe_coverage) < 0.75:
+            failures.append(
+                "valuation coverage < 75% "
+                f"(trailing {pe_coverage:.1%}, forward {forward_pe_coverage:.1%})"
+            )
     # Freshness is a weighted gate, not just a non-null price coverage check.
     # Before the fix, yesterday's NVDA price passed with 100% coverage.
     if "Yahoo Ticker" in df.columns and "Price Date" in df.columns:
@@ -3118,7 +3138,13 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                 quote_date = holding.get("Price Date")
                 quote_date = "" if pd.isna(quote_date) else str(quote_date)
                 required = us_required if is_us_quote(ticker) else ""
-                status = ("OK" if quote_date == required and price is not None else "STALE/MISSING") if required else "NON-US"
+                yahoo_error = str(holding.get("Yahoo Error") or "")
+                if price is None and yahoo_error.startswith("preflight skipped:"):
+                    status = "SKIPPED NON-EQUITY"
+                elif required:
+                    status = "OK" if quote_date == required and price is not None else "STALE/MISSING"
+                else:
+                    status = "NON-US" if price is not None else "MISSING NON-US"
                 audit.write(audit_row, 0, etf_name)
                 audit.write(audit_row, 1, ticker)
                 if price is not None:
