@@ -140,12 +140,35 @@ def fetch_public_dated_close(symbol, required):
     symbol = str(symbol).upper()
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/128.0 Safari/537.36",
                "Accept-Language": "en-US,en;q=0.9"}
+    # Cross-listed non-US symbols need the actual local-exchange history URL,
+    # not a US stock page. StockAnalysis uses AMS:BESI for BESI.AS.
+    foreign_paths = {
+        ".AS": "ams",
+        ".DE": "etr",
+        ".PA": "epa",
+        ".SW": "swx",
+        ".L": "lon",
+        ".TO": "tsx",
+        ".HK": "hkg",
+        ".T": "tyo",
+        ".TW": "tpe",
+        ".KS": "krx",
+    }
+    foreign = next(
+        ((suffix, exchange) for suffix, exchange in foreign_paths.items()
+         if symbol.endswith(suffix)), None
+    )
+    if foreign:
+        suffix, exchange = foreign
+        base = symbol[:-len(suffix)]
+        analysis_url = f"https://stockanalysis.com/quote/{exchange}/{base}/history/"
+    elif symbol in {"QQQ", "SPMO", "OEF", "MAGS", "CHAT", "DRAM", "SOXX", "SMH", "XLK"}:
+        analysis_url = f"https://stockanalysis.com/etf/{symbol.lower()}/history/"
+    else:
+        analysis_url = f"https://stockanalysis.com/stocks/{symbol.lower()}/history/"
     links = [
         ("Yahoo Finance HTML", f"https://finance.yahoo.com/quote/{symbol}/history/"),
-        ("StockAnalysis historical HTML",
-         f"https://stockanalysis.com/etf/{symbol.lower()}/history/" if symbol in
-         {"QQQ", "SPMO", "OEF", "MAGS", "CHAT", "DRAM", "SOXX", "SMH", "XLK"}
-         else f"https://stockanalysis.com/stocks/{symbol.lower()}/history/"),
+        ("StockAnalysis historical HTML", analysis_url),
     ]
     for source, url in links:
         try:
@@ -196,8 +219,9 @@ def fetch_dated_close(ticker, symbol, now=None):
     except Exception:
         pass
 
-    # The independent public-history fallback presently supports US listings.
-    if required is not None and is_us_quote(symbol):
+    # Published dated tables serve both US shares and supported foreign
+    # exchange listings when yfinance omits a completed daily candle.
+    if required is not None:
         backup_price, backup_date = fetch_public_dated_close(symbol, required)
         if backup_price is not None and backup_date == required:
             return backup_price, backup_date
