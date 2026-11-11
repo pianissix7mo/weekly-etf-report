@@ -22,6 +22,8 @@ from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from zipfile import ZipFile, BadZipFile
+from xml.etree import ElementTree as ET
 
 DEFAULT_RECIPIENTS = "mofeiwang@hotmail.com,mofeiwang@yahoo.ca"
 
@@ -51,6 +53,33 @@ def find_latest_report(report_dir: Path) -> Path:
     return candidates[0]
 
 
+def validate_report_attachment(report_path: Path) -> None:
+    """Do not email a missing, truncated, or structurally incomplete workbook."""
+    if not report_path.is_file() or report_path.stat().st_size < 10_000:
+        raise RuntimeError(f"ETF workbook is missing or unexpectedly small: {report_path}")
+    try:
+        with ZipFile(report_path) as archive:
+            bad = archive.testzip()
+            if bad:
+                raise RuntimeError(f"Corrupt XLSX ZIP entry: {bad}")
+            root = ET.fromstring(archive.read("xl/workbook.xml"))
+            ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            sheets = {
+                elem.attrib.get("name") for elem in root.findall(".//s:sheet", namespaces=ns)
+            }
+    except (BadZipFile, KeyError, ET.ParseError) as exc:
+        raise RuntimeError(f"ETF workbook XLSX is invalid: {report_path}") from exc
+
+    must_have = {
+        "Summary", "Forward PE", "QQQ", "SPMO", "OEF", "MAGS",
+        "CHAT", "DRAM", "TECH_TO", "CHPS_TO", "SOXX", "SMH",
+        "XLK", "Price_Audit", "ETF Overlap",
+    }
+    missing = sorted(must_have - sheets)
+    if missing:
+        raise RuntimeError(f"ETF workbook is missing required sheets: {missing}")
+
+
 def send_email_with_attachment(report_path: Path) -> None:
     smtp_host = env_required("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
@@ -61,10 +90,11 @@ def send_email_with_attachment(report_path: Path) -> None:
     email_to = os.environ.get("EMAIL_TO", DEFAULT_RECIPIENTS).strip() or DEFAULT_RECIPIENTS
     recipients = [x.strip() for x in email_to.split(",") if x.strip()]
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    toronto_now = datetime.now(ZoneInfo("America/Toronto"))
+    today = toronto_now.strftime("%Y-%m-%d")
 
     msg = EmailMessage()
-    msg["Subject"] = f"Weekly ETF Analyst Target Report - {today}"
+    msg["Subject"] = f"ETF Analyst Report - {today} {toronto_now:%H:%M} Toronto"
     msg["From"] = email_from
     msg["To"] = ", ".join(recipients)
     msg.set_content(
@@ -93,6 +123,7 @@ def send_email_with_attachment(report_path: Path) -> None:
 def main() -> None:
     report_dir = Path(os.environ.get("REPORT_DIR", "etf_analyst_target_outputs"))
     report_path = find_latest_report(report_dir)
+    validate_report_attachment(report_path)
 
     today_code = datetime.now(ZoneInfo("America/Toronto")).strftime("%y%m%d")
     dated_report_path = report_dir / f"ETF_analyst_report_{today_code}.xlsx"
