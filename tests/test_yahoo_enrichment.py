@@ -9,6 +9,7 @@ def _fake_row(symbol):
     row = pipeline._empty_yahoo_row(symbol)
     row.update({
         "Current Price": 100.0,
+        "Price Date": pipeline.expected_us_close_date(),
         "Target Low": 90.0,
         "Target Mean": 110.0,
         "Target High": 120.0,
