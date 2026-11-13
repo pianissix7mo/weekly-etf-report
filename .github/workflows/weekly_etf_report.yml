@@ -47,20 +47,20 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+          git fetch origin main
+          # A run must never email a workbook built from an older code
+          # revision when calculation/quote-fetching code changed mid-run.
+          if ! git diff --quiet HEAD origin/main -- \
+            etf_analyst_report_complete.py etf_report/ \
+            send_etf_report_email.py requirements.txt; then
+            echo "ETF source code changed during the run; refuse stale-code report" >&2
+            exit 1
+          fi
           git add etf_analyst_target_outputs/ETF_PE_history.xlsx
           if git diff --cached --quiet; then
             echo "PE history unchanged"
           else
             git commit -m "Update ETF PE history (manual)"
-            git fetch origin main
-            # A run must never email a workbook built from an older code
-            # revision when calculation/quote-fetching code changed mid-run.
-            if ! git diff --quiet HEAD origin/main -- \
-              etf_analyst_report_complete.py etf_report/ \
-              send_etf_report_email.py requirements.txt; then
-              echo "ETF source code changed during the run; refuse stale-code report" >&2
-              exit 1
-            fi
             git rebase origin/main
             git push origin HEAD:main
           fi
@@ -72,6 +72,8 @@ jobs:
           path: |
             etf_analyst_target_outputs/ETF_analyst_report.xlsx
             etf_analyst_target_outputs/ETF_PE_history.xlsx
+            etf_analyst_target_outputs/ETF_analyst_report.delivery.json
             etf_analyst_target_outputs/ETF_analyst_report_*.xlsx
           if-no-files-found: error
           retention-days: 30
+

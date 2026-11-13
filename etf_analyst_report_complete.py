@@ -3271,6 +3271,8 @@ def main_with_excel():
     report_started = time.perf_counter()
     pe_history = update_pe_history(summaries)
     export_excel_report(all_details, summaries, pe_history=pe_history)
+    from etf_report.delivery import write_delivery_manifest
+    write_delivery_manifest(REPORT_PATH)
     report_seconds = time.perf_counter() - report_started
 
     total_seconds = time.perf_counter() - pipeline_started

@@ -81,7 +81,9 @@ def test_main_fails_closed_and_does_not_export_partial_report(monkeypatch):
     assert calls == {"history": 0, "export": 0}
 
 
-def test_main_exports_only_after_all_required_etfs_complete(monkeypatch):
+def test_main_exports_only_after_all_required_etfs_complete(monkeypatch, tmp_path):
+    report_path = tmp_path / "ETF_analyst_report.xlsx"
+    monkeypatch.setattr(pipeline, "REPORT_PATH", report_path)
     monkeypatch.setattr(pipeline, "ETFS", ["AAA", "BBB"])
     calls = {"history": 0, "export": 0}
 
@@ -98,6 +100,7 @@ def test_main_exports_only_after_all_required_etfs_complete(monkeypatch):
         assert len(all_details) == 2
         assert len(summaries) == 2
         assert pe_history is not None
+        report_path.write_bytes(b"mock exported workbook")
 
     monkeypatch.setattr(pipeline, "run_one_etf", fake_run)
     monkeypatch.setattr(pipeline, "update_pe_history", fake_history)
@@ -134,3 +137,4 @@ def test_pe_history_read_failure_fails_closed_without_overwrite(tmp_path):
         pipeline.update_pe_history(summaries, history_path=history)
 
     assert history.read_bytes() == original
+

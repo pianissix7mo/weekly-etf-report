@@ -429,3 +429,20 @@ This project can be summarized on a resume as:
 **Mofei Wang**
 Data Science and Analytics
 GitHub: [https://github.com/pianissix7mo](https://github.com/pianissix7mo)
+
+# Email delivery validation
+
+The report generator now writes `ETF_analyst_report.delivery.json` only after a
+successful Excel export. Keep it alongside `ETF_analyst_report.xlsx`. The email
+command requires this manifest and checks the report's SHA-256, Toronto generation
+date, and (inside Actions) run ID and run attempt before creating a dated attachment.
+Generation time is distinct from the market-data timestamps in `Price_Audit`.
+Old standalone workbooks must be regenerated; renaming them is insufficient.
+
+SMTP uses certificate verification and a 30-second socket timeout. Partial
+recipient refusal fails the step and logs accepted recipients plus refusal codes.
+Acceptance means the SMTP server accepted the message, not confirmed inbox delivery.
+There is no automatic send retry: after partial acceptance, retry only refused
+recipients with `EMAIL_TO`; do not blindly rerun delivery to everyone. A full manual
+workflow rerun can still send another report; cross-run deduplication is not included.
+

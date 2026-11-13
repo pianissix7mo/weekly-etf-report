@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import os
 import smtplib
+import ssl
+from email.utils import format_datetime, make_msgid
+from etf_report.delivery import load_delivery
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -80,7 +83,8 @@ def validate_report_attachment(report_path: Path) -> None:
         raise RuntimeError(f"ETF workbook is missing required sheets: {missing}")
 
 
-def send_email_with_attachment(report_path: Path) -> None:
+def send_email_with_attachment(report_path: Path, *, data: bytes | None = None,
+                               generated_at: datetime | None = None) -> None:
     smtp_host = env_required("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
     smtp_user = env_required("SMTP_USER")
@@ -89,6 +93,9 @@ def send_email_with_attachment(report_path: Path) -> None:
     email_from = os.environ.get("EMAIL_FROM", smtp_user).strip() or smtp_user
     email_to = os.environ.get("EMAIL_TO", DEFAULT_RECIPIENTS).strip() or DEFAULT_RECIPIENTS
     recipients = [x.strip() for x in email_to.split(",") if x.strip()]
+    recipients = list(dict.fromkeys(recipients))
+    if not recipients:
+        raise RuntimeError("EMAIL_TO contains no recipients")
 
     toronto_now = datetime.now(ZoneInfo("America/Toronto"))
     today = toronto_now.strftime("%Y-%m-%d")
@@ -97,14 +104,18 @@ def send_email_with_attachment(report_path: Path) -> None:
     msg["Subject"] = f"ETF Analyst Report - {today} {toronto_now:%H:%M} Toronto"
     msg["From"] = email_from
     msg["To"] = ", ".join(recipients)
+    msg["Date"] = format_datetime(toronto_now)
+    msg["Message-ID"] = make_msgid()
     msg.set_content(
         "Hi,\n\n"
         "Attached is the latest daily ETF analyst target report.\n\n"
         f"File: {report_path.name}\n\n"
-        "This email was sent automatically by GitHub Actions.\n"
+        + (f"Report generated: {generated_at.isoformat()}\n\n" if generated_at else "")
+        + "This email was sent automatically by GitHub Actions.\n"
     )
 
-    data = report_path.read_bytes()
+    if data is None:
+        data = report_path.read_bytes()
     msg.add_attachment(
         data,
         maintype="application",
@@ -112,28 +123,36 @@ def send_email_with_attachment(report_path: Path) -> None:
         filename=report_path.name,
     )
 
-    with smtplib.SMTP_SSL(smtp_host, smtp_port) as smtp:
+    with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30,
+                          context=ssl.create_default_context()) as smtp:
         smtp.login(smtp_user, smtp_password)
-        smtp.send_message(msg)
+        refused = smtp.send_message(msg, from_addr=email_from, to_addrs=recipients)
 
-    print(f"Email sent to: {', '.join(recipients)}")
+    if refused:
+        accepted = [address for address in recipients if address not in refused]
+        print(f"SMTP accepted recipients: {', '.join(accepted)}")
+        codes = {address: result[0] for address, result in refused.items()}
+        raise RuntimeError(f"SMTP refused recipients: {codes}; do not resend to accepted recipients")
+
+    print(f"SMTP accepted email for: {', '.join(recipients)}")
     print(f"Attachment: {report_path.resolve()}")
 
 
 def main() -> None:
     report_dir = Path(os.environ.get("REPORT_DIR", "etf_analyst_target_outputs"))
-    report_path = find_latest_report(report_dir)
+    report_path, data, generated_at = load_delivery(report_dir)
     validate_report_attachment(report_path)
 
-    today_code = datetime.now(ZoneInfo("America/Toronto")).strftime("%y%m%d")
+    today_code = generated_at.strftime("%y%m%d")
     dated_report_path = report_dir / f"ETF_analyst_report_{today_code}.xlsx"
 
     if report_path.name != dated_report_path.name:
-        dated_report_path.write_bytes(report_path.read_bytes())
+        dated_report_path.write_bytes(data)
         report_path = dated_report_path
 
-    send_email_with_attachment(report_path)
+    send_email_with_attachment(report_path, data=data, generated_at=generated_at)
 
 
 if __name__ == "__main__":
     main()
+
