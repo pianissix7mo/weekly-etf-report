@@ -60,6 +60,14 @@ from etf_report.errors import (
 )
 from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_name_to_yahoo, map_to_yahoo_symbol
 from etf_report.prices import expected_completed_session_date, expected_us_close_date, fetch_dated_close, is_us_quote
+from etf_report.target_quality import (
+    CORE_TARGET_TICKERS,
+    complete_target_trio,
+    fill_alphabet_share_class_proxy,
+    fill_from_quote_summary,
+    clean_target_fields,
+    positive_float,
+)
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1157,6 +1165,9 @@ NUMERIC_YAHOO_COLUMNS = [
 # Many ETFs share the same holdings, so cache Yahoo responses in one run.
 # This avoids asking Yahoo for AAPL/MSFT/NVDA/etc. again for every ETF tab.
 YAHOO_TARGET_CACHE = {}
+# Bound direct retries and share-class backup lookups to once per run.
+YAHOO_CRITICAL_RETRIED = set()
+YAHOO_ALPHABET_DONOR_CACHE = {}
 YAHOO_FETCH_TIMINGS = {}
 PIPELINE_TIMINGS = {}
 
@@ -1558,6 +1569,7 @@ def _empty_yahoo_row(symbol, error=None):
         "Target High": None,
         "Target Median": None,
         "Analyst Count": None,
+        "Target Source": None,
         "Trailing PE": None,
         "Forward PE": None,
         "YTD Return": None,
@@ -1594,6 +1606,8 @@ def pull_yahoo_targets(symbol):
                 out["Analyst Count"] = row.get("numberOfAnalysts")
         except Exception as e:
             out["Yahoo Error"] = f"target error: {e}"
+        if any(positive_float(out.get(key)) is not None for key in ("Target Low", "Target Mean", "Target High")):
+            out["Target Source"] = "Yahoo analyst endpoint"
 
         # fast_info.last_price has no reliable session date and can silently
         # reuse the previous close after today's market has finished trading.
@@ -1613,6 +1627,10 @@ def pull_yahoo_targets(symbol):
                 info = t.info
             except Exception:
                 info = {}
+
+        # Yahoo may omit the dedicated analyst endpoint but populate these
+        # fields in the SAME share-class quote-summary response.
+        fill_from_quote_summary(out, info)
 
         if isinstance(info, dict):
             trailing_pe = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
@@ -1649,7 +1667,7 @@ def pull_yahoo_targets(symbol):
     except Exception as e:
         out["Yahoo Error"] = str(e)
 
-    return out
+    return clean_target_fields(out)
 
 
 def _pull_yahoo_targets_timed(symbol):
@@ -1678,6 +1696,11 @@ def _yahoo_row_cacheable(row):
     if "target error:" in error.lower():
         return False
     symbol = str(row.get("Yahoo Ticker") or "")
+    # Do not cache a silent Yahoo {} / None for key portfolio constituents.
+    # Minor equities may genuinely have no analyst coverage; caching those
+    # avoids expensive repeated full-history calls across every ETF tab.
+    if symbol in CORE_TARGET_TICKERS and not complete_target_trio(row):
+        return False
     expected = expected_completed_session_date(symbol)
     if expected and str(row.get("Price Date") or "") != expected:
         # A stale or still-open daily candle should never propagate across
@@ -1736,6 +1759,46 @@ def add_yahoo_targets(holdings):
                     print(f"Yahoo transient failure not cached: {symbol}")
                 result_by_symbol[symbol] = row
                 print(f"Yahoo completed {completed}/{len(to_fetch)}: {symbol} ({elapsed:.2f}s)")
+
+    # Retry a key constituent once within this pipeline run when Yahoo returns
+    # an empty/incomplete target band (including HTTP-200 empty responses).
+    # Do not unconditionally refetch every illiquid holding: that previously
+    # multiplied Yahoo timeouts across the 11 ETF tabs.
+    for symbol in symbols:
+        row = result_by_symbol[symbol]
+        if (symbol not in CORE_TARGET_TICKERS or complete_target_trio(row)
+                or symbol in YAHOO_CRITICAL_RETRIED):
+            continue
+        YAHOO_CRITICAL_RETRIED.add(symbol)
+        _, retry_row, _ = _pull_yahoo_targets_timed(symbol)
+        if complete_target_trio(retry_row):
+            print(f"Yahoo analyst targets recovered on direct retry: {symbol}")
+            result_by_symbol[symbol] = retry_row
+            if _yahoo_row_cacheable(retry_row):
+                YAHOO_TARGET_CACHE[symbol] = retry_row.copy()
+
+    # Alphabet GOOG and GOOGL have different share prices. Only if a direct
+    # same-class lookup (including quoteSummary) still fails may we use a
+    # different share class's *independently retrieved* analyst targets. Adjust
+    # all prices by the verified same-session close ratio and audit as PROXY.
+    for symbol in ("GOOGL", "GOOG"):
+        if symbol not in result_by_symbol or complete_target_trio(result_by_symbol[symbol]):
+            continue
+        peer_symbol = "GOOG" if symbol == "GOOGL" else "GOOGL"
+        peer = result_by_symbol.get(peer_symbol)
+        if peer is None:
+            peer = YAHOO_TARGET_CACHE.get(peer_symbol)
+        if peer is None:
+            if peer_symbol not in YAHOO_ALPHABET_DONOR_CACHE:
+                _, fetched_peer, _ = _pull_yahoo_targets_timed(peer_symbol)
+                YAHOO_ALPHABET_DONOR_CACHE[peer_symbol] = fetched_peer
+            peer = YAHOO_ALPHABET_DONOR_CACHE[peer_symbol]
+        if peer is not None and fill_alphabet_share_class_proxy(
+                result_by_symbol[symbol], peer, peer_symbol):
+            print(f"WARNING: {symbol} analyst targets are a labeled {peer_symbol} share-class proxy")
+            YAHOO_TARGET_CACHE[symbol] = result_by_symbol[symbol].copy()
+        else:
+            print(f"WARNING: {symbol} analyst target band is missing and cannot be safely proxied")
 
     rows = [result_by_symbol[symbol] for symbol in symbols]
     targets = pd.DataFrame(rows)
@@ -1813,6 +1876,26 @@ def validate_yahoo_data_quality(df, summary, etf):
                 "valuation coverage < 75% "
                 f"(trailing {pe_coverage:.1%}, forward {forward_pe_coverage:.1%})"
             )
+    # Overall 75% coverage can hide a missing high-weight Alphabet/NVDA/etc.
+    # Such key names must have a valid low/mean/high band, not merely a price.
+    if production_etf:
+        target_cols = {"Target Low", "Target Mean", "Target High"}
+        if not target_cols.issubset(df.columns):
+            failures.append("missing analyst target columns")
+        else:
+            ticker_series = df["Yahoo Ticker"].fillna("").astype(str)
+            key_targets = ticker_series.isin(CORE_TARGET_TICKERS) & (weights >= 0.02)
+            lows = pd.to_numeric(df["Target Low"], errors="coerce")
+            means = pd.to_numeric(df["Target Mean"], errors="coerce")
+            highs = pd.to_numeric(df["Target High"], errors="coerce")
+            valid_targets = (
+                np.isfinite(lows) & np.isfinite(means) & np.isfinite(highs)
+                & (lows > 0) & (lows <= means) & (means <= highs)
+            )
+            missing_key_targets = key_targets & ~valid_targets
+            if missing_key_targets.any():
+                names = sorted(ticker_series[missing_key_targets].unique().tolist())
+                failures.append(f"major holding missing analyst targets: {names}")
     # Freshness is a weighted gate, not just a non-null price coverage check.
     # Before the fix, yesterday's NVDA price passed with 100% coverage.
     if "Yahoo Ticker" in df.columns and "Price Date" in df.columns:
@@ -2098,6 +2181,7 @@ def prepare_detail_sheet(details):
     out["EPS Last Year"] = df["EPS Last Year"]
     out["EPS This Year Est Avg"] = df["EPS This Year Est Avg"]
     out["EPS Next Year Est Avg"] = df["EPS Next Year Est Avg"]
+    out["Target Source"] = df["Target Source"] if "Target Source" in df.columns else ""
 
     return out.sort_values("% of Portfolio", ascending=False).reset_index(drop=True)
 
@@ -3082,6 +3166,8 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                 ws.write(r, 14, row["Target Ticker"], text_fmt)
                 _write_number_or_dash(ws, r, 15, row["Worst Target"], money_fmt, normal_fmt)
                 _write_number_or_dash(ws, r, 16, row["Average Target"], money_fmt, normal_fmt)
+                if str(row.get("Target Source") or "").startswith("ALPHABET PROXY:"):
+                    ws.write_comment(r, 16, row["Target Source"])
                 _write_number_or_dash(ws, r, 17, row["Median Target"], money_fmt, normal_fmt)
                 _write_number_or_dash(ws, r, 18, row["Best Target"], money_fmt, normal_fmt)
                 _write_number_or_dash(ws, r, 19, row["EPS Last Year"], number_fmt, normal_fmt)
@@ -3168,6 +3254,46 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                 audit_row += 1
         print(f"Quote audit: {audit_row - 1} rows with exchange-local completed-session checks")
 
+        # Preserve provenance without shifting the fixed-position ETF dashboards.
+        target_audit = workbook.add_worksheet("Target_Audit")
+        writer.sheets["Target_Audit"] = target_audit
+        target_audit.freeze_panes(1, 0)
+        target_audit.set_column("A:B", 16)
+        target_audit.set_column("C:G", 17)
+        target_audit.set_column("H:H", 90)
+        target_audit.set_column("I:I", 22)
+        for column, label in enumerate([
+            "ETF", "Ticker", "Portfolio Weight %", "Target Low", "Target Mean",
+            "Target High", "Target Median", "Target Source", "Status",
+        ]):
+            target_audit.write(0, column, label, header_fmt)
+        target_row = 1
+        for details in all_details:
+            if details is None or details.empty:
+                continue
+            for _, holding in details.iterrows():
+                source = holding.get("Target Source")
+                source = "" if pd.isna(source) else str(source)
+                status = (
+                    "MISSING / INVALID" if not complete_target_trio(holding)
+                    else "PROXY - ESTIMATE" if source.startswith("ALPHABET PROXY:")
+                    else "DIRECT / SECONDARY"
+                )
+                target_audit.write(target_row, 0, str(holding.get("ETF", "")), text_fmt)
+                target_audit.write(target_row, 1, str(holding.get("Yahoo Ticker", "")), text_fmt)
+                for col, key in enumerate([
+                    "Weight", "Target Low", "Target Mean", "Target High", "Target Median"
+                ], start=2):
+                    number = positive_float(holding.get(key))
+                    if number is not None:
+                        target_audit.write_number(target_row, col, number, number_fmt)
+                    else:
+                        target_audit.write(target_row, col, "-", normal_fmt)
+                target_audit.write(target_row, 7, source, text_fmt)
+                target_audit.write(target_row, 8, status, text_fmt)
+                target_row += 1
+        print(f"Target audit: {target_row - 1} rows; analyst target sources recorded")
+
         # ---------------- ETF Overlap sheet ----------------
         _write_etf_overlap_sheet(workbook, writer, all_details, etf_sheet_map)
 
@@ -3214,7 +3340,7 @@ def run_one_etf(etf):
 
     output_cols = [
         "ETF", "Yahoo Ticker", "Raw Ticker", "Name", "Weight", "Weight Decimal",
-        "Current Price", "Price Date", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count",
+        "Current Price", "Price Date", "Target Low", "Target Mean", "Target High", "Target Median", "Analyst Count", "Target Source",
         "Trailing PE", "Forward PE", "YTD Return",
         "EPS Last Year", "EPS This Year Est Avg", "EPS Next Year Est Avg",
         "Growth Last Year", "Growth This Year Est", "Growth Next Year Est",
