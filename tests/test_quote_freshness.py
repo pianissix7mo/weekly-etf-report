@@ -59,6 +59,11 @@ def test_stale_nvda_cannot_pass_high_coverage_quality_gate(monkeypatch):
         "Weight Decimal": [0.08, 0.92],
         "Current Price": [178.67, 350.0],
         "Price Date": ["2026-11-09", "2026-11-10"],
+        # The freshness regression must use otherwise valid analyst data;
+        # missing targets are independently rejected by the quality gate.
+        "Target Low": [150.0, 300.0],
+        "Target Mean": [190.0, 370.0],
+        "Target High": [230.0, 420.0],
         "Yahoo Error": [None, None],
     })
     summary = {
