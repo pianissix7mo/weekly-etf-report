@@ -133,4 +133,5 @@ def test_dram_hierarchical_table_uses_company_exposure_rows_only():
     assert "005930.KS" in set(normalized["Yahoo Ticker"])
     assert "000660.KS" in set(normalized["Yahoo Ticker"])
     assert "285A.T" in set(normalized["Yahoo Ticker"])
+    assert "688825.SS" in set(normalized["Yahoo Ticker"])
     assert not normalized["Raw Ticker"].astype(str).str.contains("595112103 TRS").any()
