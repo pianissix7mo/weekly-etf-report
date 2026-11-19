@@ -138,3 +138,60 @@ def test_pe_history_read_failure_fails_closed_without_overwrite(tmp_path):
 
     assert history.read_bytes() == original
 
+
+
+def test_main_retries_transient_quality_failure_after_other_etfs(monkeypatch, tmp_path):
+    report_path = tmp_path / "ETF_analyst_report.xlsx"
+    monkeypatch.setattr(pipeline, "REPORT_PATH", report_path)
+    monkeypatch.setattr(pipeline, "ETFS", ["CHAT", "QQQ"])
+    pipeline.YAHOO_TARGET_CACHE.clear()
+    pipeline.YAHOO_CRITICAL_RETRIED.clear()
+    calls = []
+
+    def fake_run(etf):
+        calls.append(etf)
+        if etf == "CHAT" and calls.count("CHAT") == 1:
+            raise ReportIncompleteError(
+                "CHAT: Yahoo data quality check failed: analyst-target coverage 50%"
+            )
+        return pd.DataFrame({"ETF": [etf]}), {"ETF": etf}
+
+    def fake_export(*_args, **_kwargs):
+        report_path.write_bytes(b"mock exported workbook")
+
+    monkeypatch.setattr(pipeline, "run_one_etf", fake_run)
+    monkeypatch.setattr(pipeline, "update_pe_history", lambda _summaries: pd.DataFrame())
+    monkeypatch.setattr(pipeline, "export_excel_report", fake_export)
+
+    details, summaries, failures = pipeline.main_with_excel()
+    assert calls == ["CHAT", "QQQ", "CHAT"]
+    assert {s["ETF"] for s in summaries} == {"CHAT", "QQQ"}
+    assert len(details) == 2
+    assert failures == []
+    assert report_path.exists()
+
+
+def test_main_still_refuses_report_when_quality_retry_fails(monkeypatch):
+    monkeypatch.setattr(pipeline, "ETFS", ["CHAT"])
+    pipeline.YAHOO_TARGET_CACHE.clear()
+    calls = []
+
+    def fake_run(etf):
+        calls.append(etf)
+        raise ReportIncompleteError(
+            "CHAT: Yahoo data quality check failed: analyst-target coverage 50%"
+        )
+
+    monkeypatch.setattr(pipeline, "run_one_etf", fake_run)
+    monkeypatch.setattr(
+        pipeline, "update_pe_history",
+        lambda *_: pytest.fail("never update history when quality fails"),
+    )
+    monkeypatch.setattr(
+        pipeline, "export_excel_report",
+        lambda *_args, **_kwargs: pytest.fail("never export partial report"),
+    )
+
+    with pytest.raises(ReportIncompleteError, match="CHAT"):
+        pipeline.main_with_excel()
+    assert calls == ["CHAT", "CHAT"]
