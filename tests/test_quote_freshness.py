@@ -210,6 +210,7 @@ def test_asian_market_intraday_candle_is_not_treated_as_a_close(monkeypatch):
     assert prices.expected_completed_session_date("005930.KS", RUN_DATE) == "2026-11-10"
     assert prices.expected_completed_session_date("6857.T", RUN_DATE) == "2026-11-10"
     assert prices.expected_completed_session_date("2330.TW", RUN_DATE) == "2026-11-10"
+    assert prices.expected_completed_session_date("688825.SS", RUN_DATE) == "2026-11-10"
 
     frame = pd.DataFrame(
         {"Close": [150.0, 155.0]},
