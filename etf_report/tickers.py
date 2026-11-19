@@ -58,11 +58,19 @@ def _raw_to_yahoo_symbol(raw):
         return None
 
     s = re.sub(r"\s+(?:Equity|Common Stock)$", "", s, flags=re.I).strip()
-    suffix_map = {"US": "", "CN": ".TO", "CT": ".TO", "TT": ".TW", "JT": ".T", "JP": ".T", "NA": ".AS", "GY": ".DE", "SW": ".SW", "LN": ".L", "HK": ".HK"}
+    suffix_map = {"US": "", "CN": ".TO", "CT": ".TO", "TT": ".TW", "JT": ".T", "JP": ".T", "NA": ".AS", "GY": ".DE", "SW": ".SW", "LN": ".L", "HK": ".HK", "KS": ".KS", "KP": ".KS"}
     for suffix, yahoo_suffix in suffix_map.items():
-        m = re.fullmatch(rf"([A-Z0-9.\-]+)\s+{suffix}", s, flags=re.I)
+        m = re.fullmatch(rf"([A-Z0-9.\-]+)(?:\s+|\.){suffix}", s, flags=re.I)
         if m:
             return m.group(1).replace(".", "-").upper() + yahoo_suffix
+
+    # Bloomberg C1 identifies Shanghai A shares (do not guess other boards).
+    if re.fullmatch(r"[69][0-9]{5}(?:\s+|\.)C1", s, flags=re.I):
+        return s[:6] + ".SS"
+
+    # Already-normalized Yahoo listing codes must keep the dot suffix.
+    if re.fullmatch(r"[A-Z0-9-]+\.(?:TO|TW|T|AS|DE|SW|L|HK|KS|PA|SS|SZ)", s, flags=re.I):
+        return s.upper()
 
     m = re.fullmatch(r"([0-9]+)\s+(KS|KP)", s, flags=re.I)
     if m:
@@ -108,6 +116,11 @@ def map_to_yahoo_symbol(raw_ticker, name="", identifier=""):
     if looks_like_bad_row(f"{raw} {name}"):
         return None
 
+    # CXMT has traded on Shanghai STAR since July 2026. Roundhill may show a
+    # swap/opaque identifier rather than the listed underlying's stock code.
+    if re.search(r"\b(?:cxmt|changxin memory)\b", name, flags=re.I):
+        return "688825.SS"
+
     raw_guess = _raw_to_yahoo_symbol(raw)
     if raw_guess:
         return raw_guess
@@ -115,7 +128,7 @@ def map_to_yahoo_symbol(raw_ticker, name="", identifier=""):
     return map_name_to_yahoo(name)
 
 
-YAHOO_SUFFIXES = {".TO", ".TW", ".T", ".AS", ".DE", ".SW", ".L", ".HK", ".KS", ".PA"}
+YAHOO_SUFFIXES = {".TO", ".TW", ".T", ".AS", ".DE", ".SW", ".L", ".HK", ".KS", ".PA", ".SS", ".SZ"}
 
 
 def is_plausible_yahoo_symbol(symbol):

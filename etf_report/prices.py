@@ -24,6 +24,8 @@ _MARKETS = {
     ".TO": ("America/Toronto", (16, 5)),
     ".TW": ("Asia/Taipei", (13, 40)),
     ".KS": ("Asia/Seoul", (15, 40)),
+    ".SS": ("Asia/Shanghai", (15, 10)),
+    ".SZ": ("Asia/Shanghai", (15, 10)),
     ".T": ("Asia/Tokyo", (15, 40)),
     ".HK": ("Asia/Hong_Kong", (16, 10)),
     ".AS": ("Europe/Amsterdam", (17, 40)),
@@ -153,6 +155,8 @@ def fetch_public_dated_close(symbol, required):
         ".T": "tyo",
         ".TW": "tpe",
         ".KS": "krx",
+        ".SS": "sha",
+        ".SZ": "she",
     }
     foreign = next(
         ((suffix, exchange) for suffix, exchange in foreign_paths.items()

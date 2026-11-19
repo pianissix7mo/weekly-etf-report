@@ -1926,6 +1926,34 @@ def validate_yahoo_data_quality(df, summary, etf):
         )
 
     if failures:
+        # Print the heaviest missing symbol/field combinations. A count of
+        # Yahoo-error rows alone cannot distinguish malformed tickers from
+        # genuinely uncovered stocks or a temporary quoteSummary outage.
+        offenders = []
+        for _, holding in df.sort_values("Weight Decimal", ascending=False).iterrows():
+            ticker = str(holding.get("Yahoo Ticker") or "")
+            missing = []
+            if positive_float(holding.get("Current Price")) is None:
+                missing.append("price")
+            if not complete_target_trio(holding):
+                missing.append("target band")
+            if (positive_float(holding.get("Trailing PE")) is None
+                    and positive_float(holding.get("Forward PE")) is None):
+                missing.append("PE")
+            required_date = expected_completed_session_date(ticker)
+            if required_date and str(holding.get("Price Date") or "") != required_date:
+                missing.append("fresh close")
+            if not missing:
+                continue
+            offenders.append({
+                "symbol": ticker,
+                "weight_pct": round((safe_float_value(holding.get("Weight Decimal")) or 0) * 100, 2),
+                "missing": missing,
+                "date": str(holding.get("Price Date") or ""),
+                "yahoo_error": str(holding.get("Yahoo Error") or "")[:140],
+            })
+        print(f"{etf}: Yahoo quality offenders (heaviest 15): "
+              + json.dumps(offenders[:15], ensure_ascii=False))
         error_rows = 0
         if "Yahoo Error" in df.columns:
             error_rows = int(df["Yahoo Error"].notna().sum())
@@ -2048,7 +2076,7 @@ def build_fear_greed_summary():
 # EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-REPORT_VERSION = "forward-pe-dashboard-v12-dram"
+REPORT_VERSION = "forward-pe-dashboard-v13-roundhill-yahoo"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
 REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
@@ -3373,6 +3401,41 @@ def main_with_excel():
             print(repr(e))
             print("!" * 72)
             failures.append({"ETF": etf, "Error": repr(e)})
+
+    # Yahoo may fail silently for a subset of symbols on an earlier ETF, then
+    # recover when a later ETF requests the same stocks. Give quality failures
+    # one final attempt after the shared cache has been warmed by all ETFs.
+    # Revalidate using the *original* strict quality gates; never export on a
+    # failed retry, and do not automatically retry issuer/schema failures.
+    quality_failures = [
+        failed for failed in failures
+        if "Yahoo data quality check failed" in failed["Error"]
+    ]
+    if quality_failures:
+        uncertain_symbols = [
+            symbol for symbol, row in YAHOO_TARGET_CACHE.items()
+            if not complete_target_trio(row)
+            or (positive_float(row.get("Trailing PE")) is None
+                and positive_float(row.get("Forward PE")) is None)
+        ]
+        for symbol in uncertain_symbols:
+            YAHOO_TARGET_CACHE.pop(symbol, None)
+            YAHOO_CRITICAL_RETRIED.discard(symbol)
+        print(
+            f"Yahoo recovery pass: retrying {[f['ETF'] for f in quality_failures]}; "
+            f"invalidated {len(uncertain_symbols)} incomplete cache entries"
+        )
+        for failed in quality_failures:
+            etf = failed["ETF"]
+            try:
+                details, summary = run_one_etf(etf)
+                all_details.append(details)
+                summaries.append(summary)
+                failures.remove(failed)
+                print(f"RECOVERED: {etf} passed strict Yahoo quality checks on retry")
+            except Exception as e:
+                failed["Error"] = repr(e)
+                print(f"RETRY STILL FAILED: {etf}: {repr(e)}")
 
     completed_etfs = {str(s.get("ETF", "")).strip() for s in summaries}
     required_etfs = set(ETFS)
