@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -31,6 +32,9 @@ warnings.filterwarnings("ignore")
 # SETTINGS
 # ============================================================
 
+from etf_report.backup import FMP
+from etf_report.delivery import MANIFEST_NAME, write_delivery_manifest
+from etf_report.yahoo import YAHOO_SESSION, YahooRequestError, fetch_quote_summary, yahoo_number
 from etf_report.analytics import (
     calculate_returns,
     weighted_forward_pe,
@@ -51,7 +55,6 @@ from etf_report.config import (
     TICKER_COLS,
     YAHOO_MAX_WORKERS,
     YAHOO_RETRY_MISSING_GROWTH,
-    YAHOO_SLEEP_SECONDS,
 )
 from etf_report.errors import (
     HoldingsWeightInvalidError,
@@ -59,11 +62,10 @@ from etf_report.errors import (
     SourceSchemaChangedError,
 )
 from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_name_to_yahoo, map_to_yahoo_symbol
-from etf_report.prices import expected_completed_session_date, expected_us_close_date, fetch_dated_close, is_us_quote
+from etf_report.prices import expected_completed_session_date, expected_us_close_date, fetch_dated_close, is_us_quote, parse_dated_close, resolve_dated_close
 from etf_report.target_quality import (
     CORE_TARGET_TICKERS,
     complete_target_trio,
-    fill_alphabet_share_class_proxy,
     fill_from_quote_summary,
     clean_target_fields,
     positive_float,
@@ -1165,9 +1167,9 @@ NUMERIC_YAHOO_COLUMNS = [
 # Many ETFs share the same holdings, so cache Yahoo responses in one run.
 # This avoids asking Yahoo for AAPL/MSFT/NVDA/etc. again for every ETF tab.
 YAHOO_TARGET_CACHE = {}
-# Bound direct retries and share-class backup lookups to once per run.
-YAHOO_CRITICAL_RETRIED = set()
-YAHOO_ALPHABET_DONOR_CACHE = {}
+# Terminal attempts retain usable fields and diagnostics separately from the
+# validated cache. Transport retries and provider fallback happen before this.
+YAHOO_FAILURES = {}
 YAHOO_FETCH_TIMINGS = {}
 PIPELINE_TIMINGS = {}
 
@@ -1224,19 +1226,7 @@ def get_ytd_return_from_yahoo(symbol, verified_price=None, verified_quote_date=N
         return None
 
 
-def _yahoo_ticker_variants(symbol):
-    s = str(symbol).strip()
-    variants = [s]
-
-    # Yahoo usually uses BRK-B / BF-B, while some issuer files show BRK.B / BF.B.
-    # Do not rewrite exchange suffixes like .TO, .HK, .T, .KS.
-    if re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s.upper()):
-        variants.append(s.replace(".", "-"))
-
-    return list(dict.fromkeys(variants))
-
-
-def _clean_close_series(hist):
+def _clean_close_series(hist, allow_close=True):
     """Return a clean adjusted close series from yfinance output."""
     try:
         if hist is None or hist.empty:
@@ -1245,19 +1235,20 @@ def _clean_close_series(hist):
         if isinstance(hist.columns, pd.MultiIndex):
             adj_cols = [c for c in hist.columns if str(c[0]).lower() == "adj close"]
             close_cols = [c for c in hist.columns if str(c[0]).lower() == "close"]
-            chosen = adj_cols[0] if adj_cols else (close_cols[0] if close_cols else None)
+            chosen = adj_cols[0] if adj_cols else (close_cols[0] if allow_close and close_cols else None)
             if chosen is None:
                 return pd.Series(dtype=float)
             close = hist[chosen]
         else:
             if "Adj Close" in hist.columns:
                 close = hist["Adj Close"]
-            elif "Close" in hist.columns:
+            elif allow_close and "Close" in hist.columns:
                 close = hist["Close"]
             else:
                 return pd.Series(dtype=float)
 
-        close = pd.to_numeric(close, errors="coerce").dropna()
+        close = pd.to_numeric(close, errors="coerce")
+        close = close[np.isfinite(close) & (close > 0)]
         if close.empty:
             return pd.Series(dtype=float)
 
@@ -1271,58 +1262,23 @@ def _clean_close_series(hist):
                 pass
 
         close.index = idx
-        close = close[~close.index.isna()].sort_index()
+        close = close[~close.index.isna() & ~close.index.duplicated(keep=False)].sort_index()
         return close
     except Exception:
         return pd.Series(dtype=float)
 
 
 def _download_adjusted_close(symbol, start, end):
-    """Try several yfinance paths and return split/dividend-adjusted close prices."""
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-
-    for sym in _yahoo_ticker_variants(symbol):
-        for method in ["ticker_history", "download"]:
-            try:
-                if method == "ticker_history":
-                    hist = yf.Ticker(sym).history(
-                        start=start_ts.strftime("%Y-%m-%d"),
-                        end=end_ts.strftime("%Y-%m-%d"),
-                        auto_adjust=True,
-                        actions=False,
-                    )
-                else:
-                    hist = yf.download(
-                        sym,
-                        start=start_ts.strftime("%Y-%m-%d"),
-                        end=end_ts.strftime("%Y-%m-%d"),
-                        auto_adjust=True,
-                        progress=False,
-                        threads=False,
-                    )
-                close = _clean_close_series(hist)
-                if len(close) >= 2:
-                    return close
-            except Exception:
-                pass
-
-        # Period fallback, then filter ourselves.
-        for period in ["3y", "5y", "2y"]:
-            for method in ["ticker_history", "download"]:
-                try:
-                    if method == "ticker_history":
-                        hist = yf.Ticker(sym).history(period=period, auto_adjust=True, actions=False)
-                    else:
-                        hist = yf.download(sym, period=period, auto_adjust=True, progress=False, threads=False)
-                    close = _clean_close_series(hist)
-                    close = close[(close.index >= start_ts) & (close.index < end_ts)]
-                    if len(close) >= 2:
-                        return close
-                except Exception:
-                    pass
-
-    return pd.Series(dtype=float)
+    """Load adjusted history for standalone callers."""
+    try:
+        history = yf.Ticker(symbol, session=YAHOO_SESSION).history(
+            start=pd.Timestamp(start).strftime("%Y-%m-%d"),
+            end=pd.Timestamp(end).strftime("%Y-%m-%d"),
+            auto_adjust=False, actions=False, raise_errors=True,
+        )
+        return _clean_close_series(history, allow_close=False)
+    except Exception:
+        return pd.Series(dtype=float)
 
 
 def get_last_calendar_year_stock_return_from_yahoo(symbol):
@@ -1368,195 +1324,33 @@ def get_last_calendar_year_stock_return_from_yahoo(symbol):
     return None
 
 
-def get_yf_dataframe(ticker_obj, names):
-    for name in names:
-        try:
-            obj = getattr(ticker_obj, name, None)
-            if obj is None:
-                continue
-            df = obj() if callable(obj) else obj
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                return df.copy()
-        except Exception:
-            pass
-    return pd.DataFrame()
-
-
-def norm_label(x):
-    return re.sub(r"[^a-z0-9+\-]", "", str(x).lower())
-
-
-def find_estimate_row(df, row_patterns):
-    if df is None or df.empty:
+def annual_eps_from_income_statement(ticker):
+    try:
+        statement = ticker.get_income_stmt(freq="yearly", pretty=True)
+    except Exception:
         return None
-    pats = [norm_label(x) for x in row_patterns]
-    for idx in df.index:
-        ni = norm_label(idx)
-        for pat in pats:
-            if ni == pat or pat in ni:
-                return df.loc[idx]
+    if not isinstance(statement, pd.DataFrame) or statement.empty:
+        return None
+    for field in ("Diluted EPS", "Basic EPS", "Normalized Diluted EPS"):
+        if field in statement.index:
+            values = pd.to_numeric(statement.loc[field], errors="coerce").dropna()
+            if not values.empty:
+                return safe_float_value(values.sort_index(ascending=False).iloc[0])
     return None
 
 
-def row_average_value(row):
-    if row is None:
-        return None
-    if isinstance(row, pd.DataFrame):
-        if row.empty:
-            return None
-        row = row.iloc[0]
-
-    preferred = ["avg", "average", "avgestimate", "avg estimate", "avg.", "mean"]
-    for col in row.index:
-        nc = norm_label(col)
-        if any(norm_label(p) in nc for p in preferred):
-            v = safe_float_value(row[col])
-            if v is not None:
-                return v
-
-    for col in row.index:
-        v = safe_float_value(row[col])
-        if v is not None:
-            return v
-    return None
-
-
-def get_annual_eps_from_financials(ticker_obj):
-    candidates = []
-    for attr in ["income_stmt", "financials"]:
-        try:
-            candidates.append(getattr(ticker_obj, attr))
-        except Exception:
-            pass
-
-    for func in ["get_income_stmt", "get_financials"]:
-        try:
-            f = getattr(ticker_obj, func)
-            try:
-                candidates.append(f(freq="yearly"))
-            except TypeError:
-                candidates.append(f())
-        except Exception:
-            pass
-
-    for df in candidates:
-        try:
-            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-
-            row_key = None
-            norm_index = {norm_label(i): i for i in df.index}
-            for rn in ["Diluted EPS", "Basic EPS", "Normalized Diluted EPS", "DilutedEPS", "BasicEPS"]:
-                nrn = norm_label(rn)
-                for ni, original_idx in norm_index.items():
-                    if nrn == ni or nrn in ni:
-                        row_key = original_idx
-                        break
-                if row_key is not None:
-                    break
-
-            if row_key is None:
-                continue
-
-            row = pd.to_numeric(df.loc[row_key], errors="coerce").dropna()
-            if row.empty:
-                continue
-
-            try:
-                dates = pd.to_datetime(row.index, errors="coerce")
-                if dates.notna().sum() >= 2:
-                    row = row.iloc[np.argsort(dates.values)[::-1]]
-            except Exception:
-                pass
-
-            return safe_float_value(row.iloc[0])
-        except Exception:
-            pass
-
-    return None
-
-
-def get_eps_estimates_from_yfinance(ticker_obj, info=None):
-    df = get_yf_dataframe(ticker_obj, ["get_earnings_estimate", "earnings_estimate"])
-    eps_this_year = None
-    eps_next_year = None
-
-    if not df.empty:
-        eps_this_year = row_average_value(find_estimate_row(df, ["0y", "current year", "currentyear", "current fiscal year"]))
-        eps_next_year = row_average_value(find_estimate_row(df, ["+1y", "next year", "nextyear", "next fiscal year"]))
-
-    if not isinstance(info, dict):
-        try:
-            info = ticker_obj.get_info()
-        except Exception:
-            try:
-                info = ticker_obj.info
-            except Exception:
-                info = {}
-
-    if isinstance(info, dict):
-        if eps_this_year is None:
-            for k in ["epsCurrentYear", "currentYearEps", "earningsEstimateCurrentYear"]:
-                eps_this_year = safe_float_value(info.get(k))
-                if eps_this_year is not None:
-                    break
-        if eps_next_year is None:
-            for k in ["epsNextYear", "nextYearEps", "earningsEstimateNextYear"]:
-                eps_next_year = safe_float_value(info.get(k))
-                if eps_next_year is not None:
-                    break
-
-    return eps_this_year, eps_next_year
-
-
-def get_growth_estimates_from_yfinance(ticker_obj):
-    """Yahoo Finance Analysis -> Growth Estimates. Only this/next year are used."""
-    df = get_yf_dataframe(ticker_obj, ["get_growth_estimates", "growth_estimates"])
-    if df.empty:
-        return None, None, None
-
-    def pick_row(patterns):
-        return find_estimate_row(df, patterns)
-
-    def pick_value(row):
-        if row is None:
-            return None
-        if isinstance(row, pd.DataFrame):
-            if row.empty:
-                return None
-            row = row.iloc[0]
-        for col in row.index:
-            if any(norm_label(p) in norm_label(col) for p in ["stock trend", "stocktrend", "stock", "estimate", "growth"]):
-                v = normalize_growth_rate(row[col])
-                if v is not None:
-                    return v
-        for col in row.index:
-            v = normalize_growth_rate(row[col])
-            if v is not None:
-                return v
-        return None
-
-    last_row = pick_row(["-1y", "last year", "lastyear", "past year", "pastyear"])
-    if last_row is None:
-        last_row = pick_row(["-5y", "past 5 years", "past5years", "past 5 years per annum"])
-    this_row = pick_row(["0y", "current year", "currentyear", "current fiscal year"])
-    next_row = pick_row(["+1y", "next year", "nextyear", "next fiscal year"])
-
-    return pick_value(last_row), pick_value(this_row), pick_value(next_row)
-
-
-def get_eps_and_growth_data(ticker_obj, info=None):
-    eps_last_year = get_annual_eps_from_financials(ticker_obj)
-    eps_this_year, eps_next_year = get_eps_estimates_from_yfinance(ticker_obj, info=info)
-    _ignore_last, growth_this_year, growth_next_year = get_growth_estimates_from_yfinance(ticker_obj)
-
-    return {
-        "EPS Last Year": eps_last_year,
-        "EPS This Year Est Avg": eps_this_year,
-        "EPS Next Year Est Avg": eps_next_year,
-        "Growth This Year Est": growth_this_year,
-        "Growth Next Year Est": growth_next_year,
-    }
+def earnings_trend(result):
+    module = result.get("earningsTrend")
+    trends = module.get("trend", []) if isinstance(module, dict) else []
+    by_period = {row.get("period"): row for row in trends if isinstance(row, dict)} if isinstance(trends, list) else {}
+    fields = {}
+    for period, label in (("0y", "This Year"), ("+1y", "Next Year")):
+        row = by_period.get(period, {})
+        estimate = row.get("earningsEstimate")
+        eps = yahoo_number(estimate.get("avg")) if isinstance(estimate, dict) else None
+        fields[f"EPS {label} Est Avg"] = safe_float_value(eps)
+        fields[f"Growth {label} Est"] = normalize_growth_rate(yahoo_number(row.get("growth")))
+    return fields
 
 
 def _empty_yahoo_row(symbol, error=None):
@@ -1564,6 +1358,15 @@ def _empty_yahoo_row(symbol, error=None):
         "Yahoo Ticker": symbol,
         "Current Price": None,
         "Price Date": None,
+        "Price Source": None,
+        "Price Retrieved UTC": None,
+        "History Source": None,
+        "History End Session": None,
+        "History Retrieved UTC": None,
+        "Target Retrieved UTC": None,
+        "Trailing PE Source": None,
+        "Forward PE Source": None,
+        "PE Retrieved UTC": None,
         "Target Low": None,
         "Target Mean": None,
         "Target High": None,
@@ -1579,95 +1382,177 @@ def _empty_yahoo_row(symbol, error=None):
         "Growth Last Year": None,
         "Growth This Year Est": None,
         "Growth Next Year Est": None,
+        "Data Diagnostic": None,
         "Yahoo Error": error,
     }
 
 
+def fetch_daily_prices(symbol, ticker, required):
+    """Reuse one chart payload for the close, YTD and prior calendar year."""
+    if required is None:
+        return None, None, None, pd.Series(dtype=float), None, "unknown exchange calendar"
+    day = pd.Timestamp(required)
+    year_start = pd.Timestamp(year=day.year, month=1, day=1)
+    start = (year_start - pd.DateOffset(years=1) - pd.Timedelta(days=21)).strftime("%Y-%m-%d")
+    end = (day + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    history = None
+    issues = []
+    try:
+        history = ticker.history(start=start, end=end, auto_adjust=False, actions=False, raise_errors=True)
+        if history is None or history.empty:
+            issues.append("Yahoo history: empty response")
+    except Exception as error:
+        issues.append(f"Yahoo history: {type(error).__name__}")
+
+    close_history = history
+    short_history = None
+    _, last_observed = parse_dated_close(history)
+    if last_observed and parse_dated_close(history, required)[0] is None:
+        # A successful long date-range chart can lag the short recent window.
+        # Query the latter once for this symbol, only when a candle is missing.
+        try:
+            short = ticker.history(
+                period="5d", interval="1d", auto_adjust=False, actions=False,
+                raise_errors=True,
+            )
+            if parse_dated_close(short, required)[0] is not None:
+                short_history = close_history = short
+            else:
+                _, short_observed = parse_dated_close(short)
+                issues.append(f"Yahoo short window: observed={short_observed}, required={required}")
+        except Exception as error:
+            issues.append(f"Yahoo short window: {type(error).__name__}")
+
+    close, observed, price_source = resolve_dated_close(symbol, close_history, required)
+    if short_history is not None:
+        price_source = "Yahoo short-window daily chart"
+    if close is None:
+        issues.append(f"close missing or date mismatch: observed={observed}, required={required}")
+
+    adjusted = _clean_close_series(history, allow_close=False).loc[:day]
+    if short_history is not None and day not in adjusted:
+        recent_adjusted = _clean_close_series(short_history, allow_close=False).loc[:day]
+        overlap = adjusted.index.intersection(recent_adjusted.index)
+        if day in recent_adjusted and len(overlap) >= 2 and np.allclose(
+                adjusted.loc[overlap], recent_adjusted.loc[overlap], rtol=1e-6, atol=0):
+            # Both windows must agree on the adjusted basis before appending.
+            adjusted = pd.concat([adjusted, recent_adjusted.loc[[day]]]).sort_index()
+    source = "Yahoo dividend/split-adjusted chart"
+    baselines = [
+        pd.Timestamp(boundary) for year in (day.year - 1, day.year - 2)
+        if (boundary := expected_completed_session_date(symbol, now=f"{year}-12-31 23:00"))
+    ]
+    if day not in adjusted or any(d not in adjusted for d in baselines):
+        backup = FMP.adjusted_history(symbol, start, required)
+        # Keep a single provider's adjustment basis across both return windows.
+        sessions = [day, *baselines]
+        if sum(d in backup for d in sessions) > sum(d in adjusted for d in sessions):
+            adjusted = backup
+            source = "FMP dividend/split-adjusted end-of-day"
+    if day not in adjusted:
+        issues.append("adjusted history missing latest completed session")
+    return close, observed, price_source, adjusted, source if not adjusted.empty else None, " | ".join(issues)
+
+
+def verified_adjusted_return(symbol, history, end, prior_year=False):
+    """Compute only from observed, same-provider completed-session candles."""
+    if not end or history.empty:
+        return None
+    year = pd.Timestamp.now(tz="America/Toronto").year - int(prior_year)
+    start = expected_completed_session_date(symbol, now=f"{year-1}-12-31 23:00")
+    if prior_year:
+        end = expected_completed_session_date(symbol, now=f"{year}-12-31 23:00")
+    first, last = pd.Timestamp(start), pd.Timestamp(end)
+    if first in history and last in history and last > first:
+        return float(history[last] / history[first] - 1)
+    return None
+
+
 def pull_yahoo_targets(symbol):
     out = _empty_yahoo_row(symbol)
+    YAHOO_SESSION.begin_symbol()
+    errors = []
+    t = yf.Ticker(symbol, session=YAHOO_SESSION)
+    required = expected_completed_session_date(symbol)
+    price, day, source, history, history_source, issue = fetch_daily_prices(symbol, t, required)
+    out.update({"Current Price": price, "Price Date": day, "Price Source": source,
+                "History Source": history_source})
+    if issue:
+        errors.append(issue)
+    if price is not None:
+        out["Price Retrieved UTC"] = pd.Timestamp.now(tz="UTC").isoformat()
+    if not history.empty:
+        out["History End Session"] = history.index[-1].strftime("%Y-%m-%d")
+        out["History Retrieved UTC"] = pd.Timestamp.now(tz="UTC").isoformat()
 
     try:
-        t = yf.Ticker(symbol)
+        fundamental = fetch_quote_summary(symbol)
+    except YahooRequestError as error:
+        fundamental = {}
+        errors.append(str(error))
+    except Exception as error:
+        fundamental = {}
+        errors.append(f"Yahoo quote summary: {type(error).__name__}")
+    info = {}
+    for module in ("defaultKeyStatistics", "summaryDetail", "financialData"):
+        values = fundamental.get(module)
+        if isinstance(values, dict):
+            for key, value in values.items():
+                normalized = yahoo_number(value)
+                if normalized is not None:
+                    info[key] = normalized
+    clean_target_fields(fill_from_quote_summary(out, info))
+    if not complete_target_trio(out):
+        backup = FMP.targets(symbol)
+        if backup:
+            out.update(backup)
+        else:
+            errors.append("analyst targets: low/mean/high missing or invalid")
+    if complete_target_trio(out):
+        out["Target Retrieved UTC"] = pd.Timestamp.now(tz="UTC").isoformat()
+    else:
+        # No usable three-point consensus. Keep diagnostics, not a partial band.
+        for field in ("Target Low", "Target Mean", "Target High", "Target Median", "Target Source", "Analyst Count"):
+            out[field] = None
 
-        try:
-            targets = t.get_analyst_price_targets()
-            if isinstance(targets, dict):
-                out["Target Low"] = targets.get("low")
-                out["Target Mean"] = targets.get("mean")
-                out["Target High"] = targets.get("high")
-                out["Target Median"] = targets.get("median")
-                out["Analyst Count"] = targets.get("numberOfAnalysts")
-            elif isinstance(targets, pd.DataFrame) and not targets.empty:
-                row = targets.iloc[0]
-                out["Target Low"] = row.get("low")
-                out["Target Mean"] = row.get("mean")
-                out["Target High"] = row.get("high")
-                out["Target Median"] = row.get("median")
-                out["Analyst Count"] = row.get("numberOfAnalysts")
-        except Exception as e:
-            out["Yahoo Error"] = f"target error: {e}"
-        if any(positive_float(out.get(key)) is not None for key in ("Target Low", "Target Mean", "Target High")):
-            out["Target Source"] = "Yahoo analyst endpoint"
+    # Preserve the original Yahoo PE rebasing. Where Yahoo has no reported
+    # multiple, use the named FMP field or verified next-four-quarter EPS.
+    reference_price = positive_float(info.get("currentPrice")) or positive_float(info.get("regularMarketPrice"))
+    for field, keys, fallback, fallback_source in (
+        ("Trailing PE", ("trailingPE", "trailingPe"), lambda: FMP.trailing_pe(symbol), "FMP trailing P/E (TTM)"),
+        ("Forward PE", ("forwardPE", "forwardPe"), lambda: FMP.forward_pe(symbol, price, day),
+         "FMP verified close / next four fiscal-quarter consensus EPS"),
+    ):
+        ratio = positive_float(info.get(keys[0])) or positive_float(info.get(keys[1]))
+        if ratio is not None:
+            out[field] = ratio * (price / reference_price if price and reference_price else 1)
+            out[f"{field} Source"] = "Yahoo quote summary"
+        else:
+            out[field] = fallback()
+            if out[field] is not None:
+                out[f"{field} Source"] = fallback_source
+            else:
+                errors.append(f"{field}: missing or invalid")
+    if out["Trailing PE"] is not None or out["Forward PE"] is not None:
+        out["PE Retrieved UTC"] = pd.Timestamp.now(tz="UTC").isoformat()
 
-        # fast_info.last_price has no reliable session date and can silently
-        # reuse the previous close after today's market has finished trading.
-        # Use exchange-dated unadjusted daily candles, with a second Yahoo path.
-        out["Current Price"], out["Price Date"] = fetch_dated_close(t, symbol)
-        completed_session = expected_completed_session_date(symbol)
-        if completed_session and out["Price Date"] != completed_session:
-            print(
-                f"STALE QUOTE {symbol}: price={out['Current Price']} "
-                f"as-of={out['Price Date']} expected={completed_session}"
-            )
-
-        try:
-            info = t.get_info()
-        except Exception:
-            try:
-                info = t.info
-            except Exception:
-                info = {}
-
-        # Yahoo may omit the dedicated analyst endpoint but populate these
-        # fields in the SAME share-class quote-summary response.
-        fill_from_quote_summary(out, info)
-
-        if isinstance(info, dict):
-            trailing_pe = safe_float_value(info.get("trailingPE", info.get("trailingPe")))
-            forward_pe = safe_float_value(info.get("forwardPE", info.get("forwardPe")))
-            # Quote-summary valuation ratios may be from an earlier session.
-            # Rebase ratios using their reference quote when it is available.
-            reference_price = safe_float_value(info.get("currentPrice"))
-            if reference_price is None or reference_price <= 0:
-                reference_price = safe_float_value(info.get("regularMarketPrice"))
-            verified_price = safe_float_value(out["Current Price"])
-            if reference_price and verified_price and reference_price > 0:
-                factor = verified_price / reference_price
-                trailing_pe = trailing_pe * factor if trailing_pe is not None else None
-                forward_pe = forward_pe * factor if forward_pe is not None else None
-            out["Trailing PE"] = trailing_pe
-            out["Forward PE"] = forward_pe
-
-        out["YTD Return"] = get_ytd_return_from_yahoo(
-            symbol, verified_price=out["Current Price"],
-            verified_quote_date=out["Price Date"],
-        )
-
-        try:
-            # Reuse the info payload above instead of fetching quoteSummary twice.
-            out.update(get_eps_and_growth_data(t, info=info))
-        except Exception as e:
-            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + f"EPS/growth error: {e}"
-
-        # Hard assignment after all other updates so it cannot be overwritten by Yahoo Growth Estimates.
-        out["Growth Last Year"] = get_last_calendar_year_stock_return_from_yahoo(symbol)
-        if out["Growth Last Year"] is None:
-            out["Yahoo Error"] = (out["Yahoo Error"] + " | " if out["Yahoo Error"] else "") + "Growth Last Year unavailable from adjusted price history"
-
-    except Exception as e:
-        out["Yahoo Error"] = str(e)
-
-    return clean_target_fields(out)
+    if price is not None and day and pd.Timestamp(day) in history:
+        out["YTD Return"] = verified_adjusted_return(symbol, history, day)
+    out.update(earnings_trend(fundamental))
+    out["EPS Last Year"] = annual_eps_from_income_statement(t)
+    out["Growth Last Year"] = verified_adjusted_return(symbol, history, required, prior_year=True)
+    if out["Yahoo Error"]:
+        errors.append(out["Yahoo Error"])
+    diagnostic = " | ".join(dict.fromkeys(errors + YAHOO_SESSION.symbol_errors())) or None
+    out["Data Diagnostic"] = diagnostic
+    if not (price is not None and complete_target_trio(out) and out["Trailing PE"] and out["Forward PE"]):
+        out["Yahoo Error"] = diagnostic or "incomplete market data"
+    else:
+        out["Yahoo Error"] = None
+    print(f"DATA {symbol}: close={out['Price Source']} ({day}); targets={out['Target Source']}; "
+          f"trailing={out['Trailing PE Source']}; forward={out['Forward PE Source']}; "
+          f"history={out['History Source']}; {diagnostic or 'OK'}")
+    return out
 
 
 def _pull_yahoo_targets_timed(symbol):
@@ -1682,31 +1567,16 @@ def _pull_yahoo_targets_timed(symbol):
 
 
 def _yahoo_row_cacheable(row):
-    """Cache valid results and permanent preflight skips, not transient fetch failures."""
-    if not isinstance(row, dict):
-        return False
-    error = str(row.get("Yahoo Error") or "")
-    if error.startswith("preflight skipped:"):
-        return True
-    if safe_float_value(row.get("Current Price")) is None:
-        return False
-    # A thrown analyst-target request can materially understate the raw ETF
-    # return calculations. Let a later ETF occurrence retry instead of
-    # propagating one transient Yahoo failure across the whole run.
-    if "target error:" in error.lower():
+    """Keep only validated, independently sourced enrichment in this cache."""
+    if not isinstance(row, dict) or row.get("Yahoo Error"):
         return False
     symbol = str(row.get("Yahoo Ticker") or "")
-    # Do not cache a silent Yahoo {} / None for key portfolio constituents.
-    # Minor equities may genuinely have no analyst coverage; caching those
-    # avoids expensive repeated full-history calls across every ETF tab.
-    if symbol in CORE_TARGET_TICKERS and not complete_target_trio(row):
-        return False
     expected = expected_completed_session_date(symbol)
-    if expected and str(row.get("Price Date") or "") != expected:
-        # A stale or still-open daily candle should never propagate across
-        # the ETFs and prevent a later retry from obtaining the completed bar.
-        return False
-    return True
+    return (
+        positive_float(row.get("Current Price")) is not None
+        and expected is not None and row.get("Price Date") == expected
+        and complete_target_trio(row)
+    )
 
 
 def add_yahoo_targets(holdings):
@@ -1715,6 +1585,7 @@ def add_yahoo_targets(holdings):
     result_by_symbol = {}
     cached_count = 0
     skipped_count = 0
+    failed_count = 0
     to_fetch = []
 
     for symbol in symbols:
@@ -1727,10 +1598,18 @@ def add_yahoo_targets(holdings):
             YAHOO_TARGET_CACHE.pop(symbol, None)
             print(f"Yahoo cache bypassed transient failure: {symbol}")
 
+        if symbol in YAHOO_FAILURES:
+            failed_count += 1
+            row = YAHOO_FAILURES[symbol].copy()
+            if row.get("Price Date") != expected_completed_session_date(symbol):
+                row["Current Price"] = None
+                row["YTD Return"] = None
+            result_by_symbol[symbol] = row
+            continue
+
         if not is_plausible_yahoo_symbol(symbol):
             skipped_count += 1
             row = _empty_yahoo_row(symbol, "preflight skipped: implausible Yahoo equity symbol")
-            YAHOO_TARGET_CACHE[symbol] = row.copy()
             result_by_symbol[symbol] = row
             print(f"Yahoo preflight skipped: {symbol}")
             continue
@@ -1755,50 +1634,10 @@ def add_yahoo_targets(holdings):
                 if _yahoo_row_cacheable(row):
                     YAHOO_TARGET_CACHE[symbol] = row.copy()
                 else:
-                    YAHOO_TARGET_CACHE.pop(symbol, None)
-                    print(f"Yahoo transient failure not cached: {symbol}")
+                    YAHOO_FAILURES[symbol] = row.copy()
+                    print(f"Enrichment outside valid cache: {symbol}")
                 result_by_symbol[symbol] = row
                 print(f"Yahoo completed {completed}/{len(to_fetch)}: {symbol} ({elapsed:.2f}s)")
-
-    # Retry a key constituent once within this pipeline run when Yahoo returns
-    # an empty/incomplete target band (including HTTP-200 empty responses).
-    # Do not unconditionally refetch every illiquid holding: that previously
-    # multiplied Yahoo timeouts across the 11 ETF tabs.
-    for symbol in symbols:
-        row = result_by_symbol[symbol]
-        if (symbol not in CORE_TARGET_TICKERS or complete_target_trio(row)
-                or symbol in YAHOO_CRITICAL_RETRIED):
-            continue
-        YAHOO_CRITICAL_RETRIED.add(symbol)
-        _, retry_row, _ = _pull_yahoo_targets_timed(symbol)
-        if complete_target_trio(retry_row):
-            print(f"Yahoo analyst targets recovered on direct retry: {symbol}")
-            result_by_symbol[symbol] = retry_row
-            if _yahoo_row_cacheable(retry_row):
-                YAHOO_TARGET_CACHE[symbol] = retry_row.copy()
-
-    # Alphabet GOOG and GOOGL have different share prices. Only if a direct
-    # same-class lookup (including quoteSummary) still fails may we use a
-    # different share class's *independently retrieved* analyst targets. Adjust
-    # all prices by the verified same-session close ratio and audit as PROXY.
-    for symbol in ("GOOGL", "GOOG"):
-        if symbol not in result_by_symbol or complete_target_trio(result_by_symbol[symbol]):
-            continue
-        peer_symbol = "GOOG" if symbol == "GOOGL" else "GOOGL"
-        peer = result_by_symbol.get(peer_symbol)
-        if peer is None:
-            peer = YAHOO_TARGET_CACHE.get(peer_symbol)
-        if peer is None:
-            if peer_symbol not in YAHOO_ALPHABET_DONOR_CACHE:
-                _, fetched_peer, _ = _pull_yahoo_targets_timed(peer_symbol)
-                YAHOO_ALPHABET_DONOR_CACHE[peer_symbol] = fetched_peer
-            peer = YAHOO_ALPHABET_DONOR_CACHE[peer_symbol]
-        if peer is not None and fill_alphabet_share_class_proxy(
-                result_by_symbol[symbol], peer, peer_symbol):
-            print(f"WARNING: {symbol} analyst targets are a labeled {peer_symbol} share-class proxy")
-            YAHOO_TARGET_CACHE[symbol] = result_by_symbol[symbol].copy()
-        else:
-            print(f"WARNING: {symbol} analyst target band is missing and cannot be safely proxied")
 
     rows = [result_by_symbol[symbol] for symbol in symbols]
     targets = pd.DataFrame(rows)
@@ -1808,9 +1647,7 @@ def add_yahoo_targets(holdings):
         if col in merged.columns:
             merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
-    # The per-symbol worker already makes multiple adjusted-history attempts. The
-    # old unconditional second pass could repeat the slowest failing Yahoo calls.
-    # Keep it available as a compatibility knob, but default it off in refactor-safe.
+    # Keep the legacy, disabled-by-default compatibility knob for older callers.
     if YAHOO_RETRY_MISSING_GROWTH and "Growth Last Year" in merged.columns:
         missing = merged["Growth Last Year"].isna()
         if missing.any():
@@ -1827,7 +1664,7 @@ def add_yahoo_targets(holdings):
     slow_text = ", ".join(f"{s}={secs:.1f}s" for s, secs in slowest) if slowest else "none"
     print(
         f"Yahoo batch complete: {len(symbols)} symbols in {elapsed:.2f}s "
-        f"(new={len(to_fetch)}, cached={cached_count}, skipped={skipped_count}); slowest: {slow_text}"
+        f"(new={len(to_fetch)}, cached={cached_count}, prior incomplete={failed_count}, skipped={skipped_count}); slowest: {slow_text}"
     )
     return merged
 
@@ -1902,7 +1739,7 @@ def validate_yahoo_data_quality(df, summary, etf):
         required = df["Yahoo Ticker"].fillna("").astype(str).map(expected_completed_session_date)
         checked_quotes = required.notna()
         as_of = df["Price Date"].fillna("").astype(str)
-        stale = checked_quotes & prices.notna() & (as_of != required)
+        stale = checked_quotes & (prices.notna() | as_of.ne("")) & (as_of != required)
         stale_weight = float(weights[stale].sum() / total_weight)
         if stale_weight > 0.005:
             sample = df.loc[stale, ["Yahoo Ticker", "Price Date"]].head(8).to_dict("records")
@@ -1949,9 +1786,9 @@ def validate_yahoo_data_quality(df, summary, etf):
 # Pure calculation functions live in etf_report.analytics.
 
 def get_etf_current_price(etf):
-    price, quote_date = fetch_dated_close(yf.Ticker(etf), etf)
+    price, quote_date = fetch_dated_close(yf.Ticker(etf, session=YAHOO_SESSION), etf)
     expected = expected_completed_session_date(etf)
-    if expected and quote_date != expected:
+    if not expected or quote_date != expected or price is None:
         raise ReportIncompleteError(
             f"{etf}: ETF quote stale/missing: {quote_date}; "
             f"expected {expected}. Refusing stale ETF price."
@@ -1963,10 +1800,37 @@ def summarize_etf(df, etf):
     covered = df.dropna(subset=["Current Price", "Target Low", "Target Mean", "Target High"]).copy()
     pe_ratio, pe_cov = weighted_harmonic_pe(df)
     fpe, fpe_cov = weighted_forward_pe(df)
-    return {"ETF": etf, "Total Holdings Used": len(df), "Covered Holdings": len(covered), "Total Weight Used": df["Weight Decimal"].sum(), "Covered Weight": covered["Weight Decimal"].sum(), "ETF YTD Return": get_ytd_return_from_yahoo(
-        etf, verified_price=get_etf_current_price(etf),
-        verified_quote_date=expected_completed_session_date(etf),
-    ), "Raw Worst Case Return": covered["Weighted Low Return"].sum(), "Raw Mean Case Return": covered["Weighted Mean Return"].sum(), "Raw Best Case Return": covered["Weighted High Return"].sum(), "Raw Median Case Return": covered["Weighted Median Return"].sum(), "PE Ratio": pe_ratio, "PE Coverage Weight": pe_cov, "Forward PE": fpe, "Forward PE Coverage Weight": fpe_cov}
+    required = expected_completed_session_date(etf)
+    ticker = yf.Ticker(etf, session=YAHOO_SESSION)
+    price, day, source, history, history_source, issue = fetch_daily_prices(etf, ticker, required)
+    retrieved = pd.Timestamp.now(tz="UTC").isoformat()
+    print(f"ETF DATA {etf}: session={day}, close={source}, history={history_source}, "
+          f"retrieved={retrieved}, {issue or 'OK'}")
+    if not required or day != required or price is None:
+        raise ReportIncompleteError(f"{etf}: ETF quote stale/missing: observed={day}; expected={required}")
+    ytd = verified_adjusted_return(etf, history, day)
+    return {
+        "ETF": etf,
+        "Total Holdings Used": len(df),
+        "Covered Holdings": len(covered),
+        "Total Weight Used": df["Weight Decimal"].sum(),
+        "Covered Weight": covered["Weight Decimal"].sum(),
+        "ETF YTD Return": ytd,
+        "ETF Close": price,
+        "ETF Close Session": day,
+        "ETF Close Source": source,
+        "ETF Close Retrieved UTC": retrieved,
+        "ETF History Source": history_source,
+        "ETF History End Session": history.index[-1].strftime("%Y-%m-%d") if not history.empty else None,
+        "Raw Worst Case Return": covered["Weighted Low Return"].sum(),
+        "Raw Mean Case Return": covered["Weighted Mean Return"].sum(),
+        "Raw Best Case Return": covered["Weighted High Return"].sum(),
+        "Raw Median Case Return": covered["Weighted Median Return"].sum(),
+        "PE Ratio": pe_ratio,
+        "PE Coverage Weight": pe_cov,
+        "Forward PE": fpe,
+        "Forward PE Coverage Weight": fpe_cov,
+    }
 
 
 def print_summary(s):
@@ -1987,7 +1851,9 @@ def print_summary(s):
 
 def build_vix_summary(periods=(20, 10, 5, 3)):
     try:
-        vix = yf.download("^VIX", period="25y", auto_adjust=False, progress=False)
+        vix = yf.Ticker("^VIX", session=YAHOO_SESSION).history(
+            period="25y", auto_adjust=False, actions=False, raise_errors=True,
+        )
         if vix is None or vix.empty: raise ValueError("No VIX data returned")
         if isinstance(vix.columns, pd.MultiIndex):
             close_cols = [c for c in vix.columns if c[0] == "Close"]
@@ -2048,7 +1914,7 @@ def build_fear_greed_summary():
 # EXCEL EXPORT + PE HISTORY
 # ============================================================
 
-REPORT_VERSION = "forward-pe-dashboard-v12-dram"
+REPORT_VERSION = "forward-pe-dashboard-v13-market-data-reliability"
 PE_HISTORY_PATH = OUTPUT_DIR / "ETF_PE_history.xlsx"
 REPORT_PATH = OUTPUT_DIR / "ETF_analyst_report.xlsx"
 
@@ -2126,7 +1992,12 @@ def build_excel_summary_rows(summary_df):
     rows = []
     for _, r in summary_df.iterrows():
         etf = r["ETF"]
-        current_price = get_etf_current_price(etf)
+        if "ETF Close" in r.index:
+            current_price = positive_float(r["ETF Close"])
+            if current_price is None or r.get("ETF Close Session") != expected_completed_session_date(etf):
+                raise ReportIncompleteError(f"{etf}: ETF quote no longer matches the completed session")
+        else:
+            current_price = get_etf_current_price(etf)
         worst_return = r.get("Raw Worst Case Return")
 
         rows.append({
@@ -3223,10 +3094,26 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         audit.set_column("C:C", 17)
         audit.set_column("D:E", 20)
         audit.set_column("F:F", 21)
-        audit_headers = ["ETF", "Ticker", "Unadjusted Close", "Quote Session", "Required Session", "Status"]
+        quote_provenance = ["Price Source", "Price Retrieved UTC", "History Source",
+                            "History End Session", "History Retrieved UTC"]
+        audit.set_column("G:K", 35)
+        audit_headers = ["ETF", "Ticker", "Unadjusted Close", "Quote Session", "Required Session", "Status", *quote_provenance]
         for column, heading in enumerate(audit_headers):
             audit.write(0, column, heading, header_fmt)
         audit_row = 1
+        for summary in summaries:
+            if "ETF Close" not in summary:
+                continue
+            etf = summary["ETF"]
+            source_rows = [
+                etf, etf, summary["ETF Close"], summary["ETF Close Session"],
+                expected_completed_session_date(etf), "ETF CLOSE",
+                summary.get("ETF Close Source"), summary.get("ETF Close Retrieved UTC"),
+                summary.get("ETF History Source"), summary.get("ETF History End Session"),
+                summary.get("ETF Close Retrieved UTC") if summary.get("ETF History Source") else None,
+            ]
+            audit.write_row(audit_row, 0, source_rows)
+            audit_row += 1
         for details in all_details:
             if details is None or details.empty:
                 continue
@@ -3251,6 +3138,9 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                 audit.write(audit_row, 3, quote_date)
                 audit.write(audit_row, 4, required)
                 audit.write(audit_row, 5, status)
+                for col, key in enumerate(quote_provenance, start=6):
+                    value = holding.get(key)
+                    audit.write(audit_row, col, "" if pd.isna(value) else str(value))
                 audit_row += 1
         print(f"Quote audit: {audit_row - 1} rows with exchange-local completed-session checks")
 
@@ -3262,9 +3152,13 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         target_audit.set_column("C:G", 17)
         target_audit.set_column("H:H", 90)
         target_audit.set_column("I:I", 22)
+        valuation_provenance = ["Target Retrieved UTC", "Trailing PE Source", "Forward PE Source", "PE Retrieved UTC"]
+        valuation_provenance.append("Data Diagnostic")
+        target_audit.set_column("J:M", 38)
+        target_audit.set_column("N:N", 75)
         for column, label in enumerate([
             "ETF", "Ticker", "Portfolio Weight %", "Target Low", "Target Mean",
-            "Target High", "Target Median", "Target Source", "Status",
+            "Target High", "Target Median", "Target Source", "Status", *valuation_provenance,
         ]):
             target_audit.write(0, column, label, header_fmt)
         target_row = 1
@@ -3291,6 +3185,9 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
                         target_audit.write(target_row, col, "-", normal_fmt)
                 target_audit.write(target_row, 7, source, text_fmt)
                 target_audit.write(target_row, 8, status, text_fmt)
+                for col, key in enumerate(valuation_provenance, start=9):
+                    value = holding.get(key)
+                    target_audit.write(target_row, col, "" if pd.isna(value) else str(value))
                 target_row += 1
         print(f"Target audit: {target_row - 1} rows; analyst target sources recorded")
 
@@ -3347,6 +3244,9 @@ def run_one_etf(etf):
         "Low Return", "Mean Return", "High Return", "Median Return",
         "Weighted Low Return", "Weighted Mean Return", "Weighted High Return", "Weighted Median Return",
         "Shares Held", "Identifier", "Source Note", "Yahoo Error",
+        "Price Source", "Price Retrieved UTC", "History Source", "History End Session",
+        "History Retrieved UTC", "Target Retrieved UTC", "Trailing PE Source",
+        "Forward PE Source", "PE Retrieved UTC", "Data Diagnostic",
     ]
 
     enriched = enriched[[c for c in output_cols if c in enriched.columns]]
@@ -3356,7 +3256,13 @@ def run_one_etf(etf):
 
 def main_with_excel():
     pipeline_started = time.perf_counter()
+    (REPORT_PATH.parent / MANIFEST_NAME).unlink(missing_ok=True)
+    YAHOO_SESSION.reset()
+    FMP.reset()
+    for cache in (YAHOO_TARGET_CACHE, YAHOO_FAILURES, YAHOO_FETCH_TIMINGS, PIPELINE_TIMINGS):
+        cache.clear()
     print(f"ETF analyst report version: {REPORT_VERSION}")
+    print("FMP fallback configured: " + ("yes" if os.getenv("FMP_API_KEY") else "no"))
 
     all_details = []
     summaries = []
@@ -3374,6 +3280,7 @@ def main_with_excel():
             print("!" * 72)
             failures.append({"ETF": etf, "Error": repr(e)})
 
+    print("Yahoo transport after ETF enrichment: " + json.dumps(dict(YAHOO_SESSION.metrics), sort_keys=True))
     completed_etfs = {str(s.get("ETF", "")).strip() for s in summaries}
     required_etfs = set(ETFS)
     missing_required = sorted(required_etfs - completed_etfs)
@@ -3397,9 +3304,9 @@ def main_with_excel():
     report_started = time.perf_counter()
     pe_history = update_pe_history(summaries)
     export_excel_report(all_details, summaries, pe_history=pe_history)
-    from etf_report.delivery import write_delivery_manifest
     write_delivery_manifest(REPORT_PATH)
     report_seconds = time.perf_counter() - report_started
+    print("Yahoo transport after workbook export: " + json.dumps(dict(YAHOO_SESSION.metrics), sort_keys=True))
 
     total_seconds = time.perf_counter() - pipeline_started
     print("\n" + "=" * 72)

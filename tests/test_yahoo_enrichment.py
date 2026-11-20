@@ -224,14 +224,13 @@ def test_last_calendar_year_uses_prior_year_end_close(monkeypatch):
 def test_transient_yahoo_failure_is_not_reused_from_cache(monkeypatch):
     pipeline.YAHOO_TARGET_CACHE.clear()
     pipeline.YAHOO_FETCH_TIMINGS.clear()
-    pipeline.YAHOO_CRITICAL_RETRIED.clear()
+    monkeypatch.setattr(pipeline, "YAHOO_FAILURES", {})
     calls = []
 
     def fake_pull(symbol):
         calls.append(symbol)
-        # Critical holdings are retried immediately once. Simulate both
-        # attempts failing, then a later ETF occurrence recovering.
-        if len(calls) <= 2:
+        # The worker already exhausted its provider fallback and retry budget.
+        if len(calls) == 1:
             return pipeline._empty_yahoo_row(symbol, "temporary outage")
         return _fake_row(symbol)
 
@@ -242,27 +241,26 @@ def test_transient_yahoo_failure_is_not_reused_from_cache(monkeypatch):
     holdings = pd.DataFrame({"Yahoo Ticker": ["AAPL"], "Weight": [100.0]})
     first = pipeline.add_yahoo_targets(holdings)
     assert pd.isna(first.iloc[0]["Current Price"])
-    assert calls == ["AAPL", "AAPL"]
+    assert calls == ["AAPL"]
     assert "AAPL" not in pipeline.YAHOO_TARGET_CACHE
 
     second = pipeline.add_yahoo_targets(holdings)
-    assert second.iloc[0]["Current Price"] == 100.0
-    assert calls == ["AAPL", "AAPL", "AAPL"]
-    assert "AAPL" in pipeline.YAHOO_TARGET_CACHE
+    assert pd.isna(second.iloc[0]["Current Price"])
+    assert calls == ["AAPL"]
+    assert "AAPL" not in pipeline.YAHOO_TARGET_CACHE
 
 
 def test_target_fetch_error_with_price_is_not_cached(monkeypatch):
     pipeline.YAHOO_TARGET_CACHE.clear()
     pipeline.YAHOO_FETCH_TIMINGS.clear()
-    pipeline.YAHOO_CRITICAL_RETRIED.clear()
+    monkeypatch.setattr(pipeline, "YAHOO_FAILURES", {})
     calls = []
 
     def fake_pull(symbol):
         calls.append(symbol)
         row = _fake_row(symbol)
-        # The first direct request and the single immediate retry both
-        # hit the rate limit; only a later attempt can recover.
-        if len(calls) <= 2:
+        # All target sources have already been tried by the worker.
+        if len(calls) == 1:
             row["Target Low"] = None
             row["Target Mean"] = None
             row["Target High"] = None
@@ -277,10 +275,11 @@ def test_target_fetch_error_with_price_is_not_cached(monkeypatch):
     holdings = pd.DataFrame({"Yahoo Ticker": ["NVDA"], "Weight": [100.0]})
     first = pipeline.add_yahoo_targets(holdings)
     assert pd.isna(first.iloc[0]["Target Mean"])
-    assert calls == ["NVDA", "NVDA"]
+    assert calls == ["NVDA"]
     assert "NVDA" not in pipeline.YAHOO_TARGET_CACHE
 
     second = pipeline.add_yahoo_targets(holdings)
-    assert second.iloc[0]["Target Mean"] == 110.0
-    assert calls == ["NVDA", "NVDA", "NVDA"]
-    assert "NVDA" in pipeline.YAHOO_TARGET_CACHE
+    assert pd.isna(second.iloc[0]["Target Mean"])
+    assert second.iloc[0]["Current Price"] == 100.0
+    assert calls == ["NVDA"]
+    assert "NVDA" not in pipeline.YAHOO_TARGET_CACHE

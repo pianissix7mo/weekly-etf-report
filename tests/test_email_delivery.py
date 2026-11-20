@@ -127,3 +127,60 @@ def test_transport_failures_propagate_without_retry(report, smtp, error):
     with pytest.raises(type(error)):
         emailer.send_email_with_attachment(report)
     connection.send_message.assert_called_once()
+
+
+def test_complete_pipeline_exports_pe_history_and_emails_generated_workbook(tmp_path, monkeypatch, smtp):
+    from collections import Counter
+
+    import openpyxl
+    import pandas as pd
+    import etf_analyst_report_complete as pipeline
+
+    report = tmp_path / "ETF_analyst_report.xlsx"
+    history = tmp_path / "ETF_PE_history.xlsx"
+    monkeypatch.setattr(pipeline, "REPORT_PATH", report)
+    monkeypatch.setattr(pipeline, "PE_HISTORY_PATH", history)
+    monkeypatch.setenv("REPORT_DIR", str(tmp_path))
+    calls = Counter()
+
+    def holdings(etf):
+        return pd.DataFrame({"ETF": [etf], "Yahoo Ticker": ["TSLA"], "Weight": [100.0]})
+
+    def ticker(symbol):
+        calls[symbol] += 1
+        row = pipeline._empty_yahoo_row(symbol)
+        row.update({
+            "Current Price": 100, "Price Date": pipeline.expected_completed_session_date(symbol),
+            "Target Low": 90, "Target Mean": 110, "Target High": 125, "Target Median": 108,
+            "Trailing PE": 20, "Forward PE": 17, "Price Source": "Yahoo daily chart",
+            "Target Source": "FMP price target consensus",
+        })
+        return row
+
+    def fund_data(symbol, _ticker, required):
+        calls[symbol] += 1
+        return 50, required, "Yahoo daily chart", pd.Series(dtype=float), None, ""
+
+    def no_refetch(*args):
+        pytest.fail("Excel formatting cannot refetch a verified ETF close")
+
+    monkeypatch.setattr(pipeline, "pull_issuer_holdings", holdings)
+    monkeypatch.setattr(pipeline, "pull_yahoo_targets", ticker)
+    monkeypatch.setattr(pipeline, "fetch_daily_prices", fund_data)
+    monkeypatch.setattr(pipeline.yf, "Ticker", lambda *args, **kwargs: object())
+    monkeypatch.setattr(pipeline, "get_etf_current_price", no_refetch)
+    monkeypatch.setattr(pipeline, "build_vix_summary", lambda: (pd.DataFrame(), "fixture"))
+    monkeypatch.setattr(pipeline, "build_fear_greed_summary", lambda: (pd.DataFrame(), "fixture"))
+
+    pipeline.main_with_excel()
+    workbook = openpyxl.load_workbook(report)
+    assert {"Summary", "Forward PE", "Price_Audit", "Target_Audit", "ETF Overlap"} <= set(workbook.sheetnames)
+    assert any(cell.data_type == "f" for row in workbook["QQQ"] for cell in row)
+    assert workbook["Price_Audit"]["F2"].value == "ETF CLOSE"
+    assert set(pd.read_excel(history)["ETF"]) == set(pipeline.ETFS)
+    assert calls == Counter({symbol: 1 for symbol in (*pipeline.ETFS, "TSLA")})
+    emailer.main()
+    _, connection = smtp
+    connection.send_message.assert_called_once()
+    attachment = next(connection.send_message.call_args.args[0].iter_attachments())
+    assert attachment.get_payload(decode=True) == report.read_bytes()

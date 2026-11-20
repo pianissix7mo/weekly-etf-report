@@ -86,10 +86,9 @@ def test_empty_core_ticker_targets_are_not_cached(monkeypatch):
     assert pipeline._yahoo_row_cacheable(row)
 
 
-def test_missing_googl_target_tries_direct_then_peer(monkeypatch):
+def test_missing_googl_target_is_never_filled_from_another_class(monkeypatch):
     monkeypatch.setattr(pipeline, "YAHOO_TARGET_CACHE", {})
-    monkeypatch.setattr(pipeline, "YAHOO_CRITICAL_RETRIED", set())
-    monkeypatch.setattr(pipeline, "YAHOO_ALPHABET_DONOR_CACHE", {})
+    monkeypatch.setattr(pipeline, "YAHOO_FAILURES", {})
     monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda symbol: "2026-11-12")
     calls = Counter()
 
@@ -101,9 +100,9 @@ def test_missing_googl_target_tries_direct_then_peer(monkeypatch):
     monkeypatch.setattr(pipeline, "_pull_yahoo_targets_timed", fake_fetch)
     holdings = pd.DataFrame({"Yahoo Ticker": ["GOOGL"], "Weight": [15.0]})
     result = pipeline.add_yahoo_targets(holdings)
-    assert calls == {"GOOGL": 2, "GOOG": 1}
-    assert result.iloc[0]["Target Mean"] == pytest.approx(400 * 298 / 295)
-    assert "ALPHABET PROXY" in result.iloc[0]["Target Source"]
+    assert calls == {"GOOGL": 1}
+    assert pd.isna(result.iloc[0]["Target Mean"])
+    assert pd.isna(result.iloc[0]["Target Source"])
 
 
 def test_major_googl_target_gap_fails_quality_gate(monkeypatch):

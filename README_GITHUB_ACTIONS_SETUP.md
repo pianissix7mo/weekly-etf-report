@@ -446,3 +446,37 @@ There is no automatic send retry: after partial acceptance, retry only refused
 recipients with `EMAIL_TO`; do not blindly rerun delivery to everyone. A full manual
 workflow rerun can still send another report; cross-run deduplication is not included.
 
+
+## Market data fallback and live validation
+
+The production workflow runs market-data collection once. Yahoo requests are
+paced across workers. Sustained denials or HTTP 429 responses open circuits.
+GitHub Actions logs show requests, response classifications, circuit skips,
+ticker-level diagnostics, and ETF validation results.
+
+The previous Stock Analysis history-page fallback was removed because its
+[Terms of Use](https://stockanalysis.com/terms-of-use/) prohibit automated
+access. The fallback uses a licensed market-data API.
+
+The optional Financial Modeling Prep Stable API fallback reads `FMP_API_KEY`
+from a GitHub Actions repository secret (or a local environment variable).
+The account needs permission for unadjusted and dividend-adjusted EOD
+history, price target consensus, TTM ratios, company profiles and quarterly
+analyst estimates. Check your plan's endpoint entitlements, symbol coverage,
+and terms for report distribution before enabling it. No new subscription is
+required to continue using Yahoo. If the FMP secret is absent, the licensed
+fallback is unavailable.
+
+FMP lookups require exact listing symbols. Supported foreign exchanges also
+require a matching country and currency in the listing profile. Forward P/E
+uses the verified close divided by the next four consecutive fiscal quarters
+of EPS consensus for non-ADR US listings in USD. Trailing P/E uses the provider's TTM
+ratio. FMP marks the target retrieval time and the API does not expose a
+consensus publication timestamp. If a listing or field is unsupported, it
+remains missing and the normal portfolio checks apply. Quote and Target
+audit sheets record sources and retrieval timestamps.
+
+The **ETF Live Data Audit (No Email)** runs for same-repository report-code
+pull requests and can be dispatched manually on a selected revision. It
+validates all required ETFs, writes a runner-local history workbook, and
+uploads the report on success. It does not commit history or send an email.
