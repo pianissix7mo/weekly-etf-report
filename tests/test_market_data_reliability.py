@@ -106,7 +106,7 @@ def test_fmp_uses_named_fields_and_verified_quarters(monkeypatch):
     backup = FMPBackup()
     monkeypatch.setenv("FMP_API_KEY", "fixture")
     payload = {
-        "profile": [{"symbol": "TSLA", "currency": "USD", "isAdr": False}],
+        "profile": [{"symbol": "TSLA", "country": "US", "currency": "USD", "isAdr": False}],
         "price-target-consensus": [
             {"symbol": "GOOGL", "targetLow": 20, "targetHigh": 40, "targetConsensus": 30},
             {"symbol": "TSLA", "targetLow": 200, "targetHigh": 400, "targetMedian": 280, "targetConsensus": 300},
@@ -146,6 +146,31 @@ def test_fmp_uses_named_fields_and_verified_quarters(monkeypatch):
     assert backup.forward_pe("TSLA", 280, "2026-11-19") is None
 
 
+@pytest.mark.parametrize(("returned_symbol", "country", "currency", "price"), [
+    ("BESI.AS", "NL", "EUR", 150.8),
+    ("BESI", "US", "USD", None),
+    ("BESI.AS", "NL", "USD", None),
+])
+def test_foreign_fmp_backup_requires_exact_listing_and_currency(
+        monkeypatch, returned_symbol, country, currency, price):
+    monkeypatch.setenv("FMP_API_KEY", "fixture")
+    sent = []
+
+    def get(url, **kwargs):
+        assert kwargs["params"]["symbol"] == "BESI.AS"
+        endpoint = url.split("/stable/")[1]
+        sent.append(endpoint)
+        rows = (
+            [{"symbol": returned_symbol, "country": country, "currency": currency, "isAdr": False}]
+            if endpoint == "profile" else [{"symbol": "BESI.AS", "date": "2026-11-19", "adjClose": 150.8}]
+        )
+        return SimpleNamespace(status_code=200, json=lambda: rows)
+
+    monkeypatch.setattr("etf_report.backup.requests.get", get)
+    assert FMPBackup().close("BESI.AS", "2026-11-19") == price
+    assert sent == (["profile", "historical-price-eod/non-split-adjusted"] if price else ["profile"])
+
+
 def test_successful_fallback_combines_with_yahoo_and_reuses_one_chart(monkeypatch):
     monkeypatch.setattr(pipeline, "YAHOO_TARGET_CACHE", {})
     monkeypatch.setattr(pipeline, "YAHOO_FAILURES", {})
@@ -183,7 +208,6 @@ def test_successful_fallback_combines_with_yahoo_and_reuses_one_chart(monkeypatc
 
     monkeypatch.setattr(pipeline.yf, "Ticker", Ticker)
     monkeypatch.setattr(pipeline, "fetch_quote_summary", get_fundamentals)
-    monkeypatch.setattr(prices, "fetch_public_dated_close", lambda *args: (None, None))
     monkeypatch.setattr(pipeline.FMP, "close", lambda *a: 100)
     monkeypatch.setattr(pipeline.FMP, "adjusted_history", lambda *a: rows["Adj Close"])
     monkeypatch.setattr(pipeline.FMP, "trailing_pe", lambda *a: 27)

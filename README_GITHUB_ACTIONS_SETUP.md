@@ -454,9 +454,9 @@ paced across workers. Sustained denials or HTTP 429 responses open circuits.
 GitHub Actions logs show requests, response classifications, circuit skips,
 ticker-level diagnostics, and ETF validation results.
 
-The existing StockAnalysis historical table is used for exact-session closing
-prices only. It does not provide analyst consensus, P/E, or adjusted history
-to this pipeline.
+The previous Stock Analysis history-page fallback was removed because its
+[Terms of Use](https://stockanalysis.com/terms-of-use/) prohibit automated
+access. The fallback uses a licensed market-data API.
 
 The optional Financial Modeling Prep Stable API fallback reads `FMP_API_KEY`
 from a GitHub Actions repository secret (or a local environment variable).
@@ -464,11 +464,13 @@ The account needs permission for unadjusted and dividend-adjusted EOD
 history, price target consensus, TTM ratios, company profiles and quarterly
 analyst estimates. Check your plan's endpoint entitlements, symbol coverage,
 and terms for report distribution before enabling it. No new subscription is
-required to continue using Yahoo and the existing public close fallback.
+required to continue using Yahoo. If the FMP secret is absent, the licensed
+fallback is unavailable.
 
-FMP lookups require exact US or Toronto listing symbols. Forward P/E uses
-the verified close divided by the next four consecutive fiscal quarters of
-EPS consensus for non-ADR USD listings. Trailing P/E uses the provider's TTM
+FMP lookups require exact listing symbols. Supported foreign exchanges also
+require a matching country and currency in the listing profile. Forward P/E
+uses the verified close divided by the next four consecutive fiscal quarters
+of EPS consensus for non-ADR US listings in USD. Trailing P/E uses the provider's TTM
 ratio. FMP marks the target retrieval time and the API does not expose a
 consensus publication timestamp. If a listing or field is unsupported, it
 remains missing and the normal portfolio checks apply. Quote and Target

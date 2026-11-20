@@ -1,7 +1,7 @@
 """Optional, licensed Financial Modeling Prep fallback.
 
-The Stable API returns listing symbols in each record. Only documented exact
-listing symbols are eligible. The public close fallback handles other markets.
+The Stable API returns listing symbols in each record. Foreign listings
+also require a matching currency, country and non-ADR company profile.
 """
 import os
 import re
@@ -14,6 +14,21 @@ import requests
 from etf_report.target_quality import complete_target_trio, positive_float
 
 
+# Exact Yahoo suffixes only. London is excluded because GBP and GBp quote
+# units are not interchangeable and the profile does not prove the target unit.
+FOREIGN_MARKETS = {
+    ".TO": ("CA", "CAD"),
+    ".TW": ("TW", "TWD"),
+    ".KS": ("KR", "KRW"),
+    ".T": ("JP", "JPY"),
+    ".HK": ("HK", "HKD"),
+    ".AS": ("NL", "EUR"),
+    ".DE": ("DE", "EUR"),
+    ".SW": ("CH", "CHF"),
+    ".PA": ("FR", "EUR"),
+}
+
+
 class FMPBackup:
     def __init__(self):
         self.lock = Lock()
@@ -21,11 +36,14 @@ class FMPBackup:
 
     def reset(self):
         self.blocked = set()
+        self.profiles = {}
+        self.profile_failures = set()
 
     def _records(self, endpoint, symbol, **params):
         key = os.getenv("FMP_API_KEY")
-        # Exact US or Toronto symbols. Do not infer foreign listings or share classes.
-        if not key or not re.fullmatch(r"(?:[A-Z]{1,6}(?:-[A-Z])?|[A-Z]{1,6}\.TO)", symbol):
+        if not key or not re.fullmatch(r"[A-Z0-9]{1,8}(?:-[A-Z])?(?:\.[A-Z]{1,2})?", symbol):
+            return []
+        if endpoint != "profile" and not self._verified_listing(symbol):
             return []
         with self.lock:
             if "*" in self.blocked or endpoint in self.blocked:
@@ -53,6 +71,28 @@ class FMPBackup:
         if not rows:
             print(f"FMP {endpoint} {symbol}: empty or listing mismatch")
         return rows
+
+    def _profile(self, symbol):
+        if symbol in self.profiles:
+            return self.profiles[symbol]
+        if symbol in self.profile_failures:
+            return {}
+        rows = self._records("profile", symbol)
+        if len(rows) == 1 and isinstance(rows[0].get("country"), str) and isinstance(rows[0].get("currency"), str):
+            self.profiles[symbol] = rows[0]
+            return rows[0]
+        self.profile_failures.add(symbol)
+        return {}
+
+    def _verified_listing(self, symbol):
+        if "." not in symbol:
+            return True
+        _, suffix = symbol.rsplit(".", 1)
+        expected = FOREIGN_MARKETS.get("." + suffix)
+        if expected is None:
+            return False
+        profile = self._profile(symbol)
+        return profile.get("isAdr") is False and (profile.get("country"), profile.get("currency")) == expected
 
     def close(self, symbol, session):
         rows = self._records("historical-price-eod/non-split-adjusted", symbol, **{"from": session, "to": session})
@@ -99,8 +139,8 @@ class FMPBackup:
         # currency metadata with which to validate a foreign EPS denominator.
         if "." in symbol or not os.getenv("FMP_API_KEY"):
             return None
-        profiles = self._records("profile", symbol)
-        if len(profiles) != 1 or profiles[0].get("currency") != "USD" or profiles[0].get("isAdr") is not False:
+        profile = self._profile(symbol)
+        if profile.get("currency") != "USD" or profile.get("country") != "US" or profile.get("isAdr") is not False:
             return None
         session_date = date.fromisoformat(session)
         rows = self._records("analyst-estimates", symbol, period="quarter", page=0, limit=20)
