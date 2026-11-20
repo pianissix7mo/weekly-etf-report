@@ -42,7 +42,9 @@ class YahooSession(Session):
     """Serialize wire requests and share pacing and circuit state across workers."""
 
     def __init__(self, interval=0.5):
-        super().__init__(timeout=12)
+        # Match yfinance 0.2.66's default curl session. Keep one fixed session
+        # and never change its identity in response to a provider denial.
+        super().__init__(impersonate="chrome", timeout=12)
         self.interval = interval
         self.lock = Lock()
         self.context = local()
