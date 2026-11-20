@@ -57,7 +57,9 @@ class FMPBackup:
     def close(self, symbol, session):
         rows = self._records("historical-price-eod/non-split-adjusted", symbol, **{"from": session, "to": session})
         matches = [r for r in rows if r.get("date") == session]
-        return positive_float(matches[0].get("close")) if len(matches) == 1 else None
+        # The non-split-adjusted endpoint names its raw session close adjClose.
+        # The same spelling is dividend-adjusted on the separate history route.
+        return positive_float(matches[0].get("adjClose")) if len(matches) == 1 else None
 
     def adjusted_history(self, symbol, start, end):
         rows = self._records("historical-price-eod/dividend-adjusted", symbol, **{"from": start, "to": end})

@@ -30,8 +30,8 @@ def transport(monkeypatch, outcomes):
         outcome = next(outcomes)
         if isinstance(outcome, Exception):
             raise outcome
-        status, headers = outcome
-        return SimpleNamespace(status_code=status, headers=headers)
+        status, headers, *body = outcome
+        return SimpleNamespace(status_code=status, headers=headers, text=body[0] if body else "")
 
     monkeypatch.setattr(Session, "request", request)
     monkeypatch.setattr(yahoo, "monotonic", lambda: clock[0])
@@ -60,6 +60,17 @@ def test_429_honors_retry_after_then_opens_circuit_globally(monkeypatch):
         client.get(CHART)
     assert sent == [(QUOTE, 10, 12), (QUOTE, 13, 12)]
     assert client.metrics["quotesummary retry"] == 1
+
+
+def test_rate_limit_text_in_crumb_response_is_not_treated_as_a_credential(monkeypatch):
+    client, sent = transport(monkeypatch, iter([(200, {}, "Too Many Requests")] * 2))
+    crumb = "https://query1.finance.yahoo.com/v1/test/getcrumb"
+    with pytest.raises(yahoo.YahooRequestError, match="429"):
+        client.get(crumb)
+    with pytest.raises(yahoo.YahooRequestError, match="rate-limit circuit open"):
+        client.get(CHART)
+    assert len(sent) == 2
+    assert client.metrics["getcrumb rate-limit payload"] == 2
 
 
 def test_timeout_retries_with_jitter_and_does_not_authenticate_again(monkeypatch):
@@ -102,8 +113,8 @@ def test_fmp_uses_named_fields_and_verified_quarters(monkeypatch):
         ],
         "ratios-ttm": [{"symbol": "TSLA", "priceToEarningsRatioTTM": 27, "forwardPriceToEarningsGrowthRatioTTM": 450}],
         "historical-price-eod/non-split-adjusted": [
-            {"symbol": "TSLA", "date": "2026-11-18", "close": 275},
-            {"symbol": "TSLA", "date": "2026-11-19", "close": 280},
+            {"symbol": "TSLA", "date": "2026-11-18", "adjClose": 275},
+            {"symbol": "TSLA", "date": "2026-11-19", "adjClose": 280, "close": 5},
         ],
         "historical-price-eod/dividend-adjusted": [
             {"symbol": "TSLA", "date": "2026-11-19", "adjClose": 280, "close": 5},

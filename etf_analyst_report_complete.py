@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1325,7 +1326,7 @@ def get_last_calendar_year_stock_return_from_yahoo(symbol):
 
 def annual_eps_from_income_statement(ticker):
     try:
-        statement = ticker.get_income_stmt(freq="yearly")
+        statement = ticker.get_income_stmt(freq="yearly", pretty=True)
     except Exception:
         return None
     if not isinstance(statement, pd.DataFrame) or statement.empty:
@@ -1774,12 +1775,34 @@ def summarize_etf(df, etf):
     required = expected_completed_session_date(etf)
     ticker = yf.Ticker(etf, session=YAHOO_SESSION)
     price, day, source, history, history_source, issue = fetch_daily_prices(etf, ticker, required)
+    retrieved = pd.Timestamp.now(tz="UTC").isoformat()
     print(f"ETF DATA {etf}: session={day}, close={source}, history={history_source}, "
-          f"retrieved={pd.Timestamp.now(tz='UTC').isoformat()}, {issue or 'OK'}")
+          f"retrieved={retrieved}, {issue or 'OK'}")
     if not required or day != required or price is None:
         raise ReportIncompleteError(f"{etf}: ETF quote stale/missing: observed={day}; expected={required}")
     ytd = verified_adjusted_return(etf, history, day)
-    return {"ETF": etf, "Total Holdings Used": len(df), "Covered Holdings": len(covered), "Total Weight Used": df["Weight Decimal"].sum(), "Covered Weight": covered["Weight Decimal"].sum(), "ETF YTD Return": ytd, "Raw Worst Case Return": covered["Weighted Low Return"].sum(), "Raw Mean Case Return": covered["Weighted Mean Return"].sum(), "Raw Best Case Return": covered["Weighted High Return"].sum(), "Raw Median Case Return": covered["Weighted Median Return"].sum(), "PE Ratio": pe_ratio, "PE Coverage Weight": pe_cov, "Forward PE": fpe, "Forward PE Coverage Weight": fpe_cov}
+    return {
+        "ETF": etf,
+        "Total Holdings Used": len(df),
+        "Covered Holdings": len(covered),
+        "Total Weight Used": df["Weight Decimal"].sum(),
+        "Covered Weight": covered["Weight Decimal"].sum(),
+        "ETF YTD Return": ytd,
+        "ETF Close": price,
+        "ETF Close Session": day,
+        "ETF Close Source": source,
+        "ETF Close Retrieved UTC": retrieved,
+        "ETF History Source": history_source,
+        "ETF History End Session": history.index[-1].strftime("%Y-%m-%d") if not history.empty else None,
+        "Raw Worst Case Return": covered["Weighted Low Return"].sum(),
+        "Raw Mean Case Return": covered["Weighted Mean Return"].sum(),
+        "Raw Best Case Return": covered["Weighted High Return"].sum(),
+        "Raw Median Case Return": covered["Weighted Median Return"].sum(),
+        "PE Ratio": pe_ratio,
+        "PE Coverage Weight": pe_cov,
+        "Forward PE": fpe,
+        "Forward PE Coverage Weight": fpe_cov,
+    }
 
 
 def print_summary(s):
@@ -1941,7 +1964,12 @@ def build_excel_summary_rows(summary_df):
     rows = []
     for _, r in summary_df.iterrows():
         etf = r["ETF"]
-        current_price = get_etf_current_price(etf)
+        if "ETF Close" in r.index:
+            current_price = positive_float(r["ETF Close"])
+            if current_price is None or r.get("ETF Close Session") != expected_completed_session_date(etf):
+                raise ReportIncompleteError(f"{etf}: ETF quote no longer matches the completed session")
+        else:
+            current_price = get_etf_current_price(etf)
         worst_return = r.get("Raw Worst Case Return")
 
         rows.append({
@@ -3045,6 +3073,19 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         for column, heading in enumerate(audit_headers):
             audit.write(0, column, heading, header_fmt)
         audit_row = 1
+        for summary in summaries:
+            if "ETF Close" not in summary:
+                continue
+            etf = summary["ETF"]
+            source_rows = [
+                etf, etf, summary["ETF Close"], summary["ETF Close Session"],
+                expected_completed_session_date(etf), "ETF CLOSE",
+                summary.get("ETF Close Source"), summary.get("ETF Close Retrieved UTC"),
+                summary.get("ETF History Source"), summary.get("ETF History End Session"),
+                summary.get("ETF Close Retrieved UTC") if summary.get("ETF History Source") else None,
+            ]
+            audit.write_row(audit_row, 0, source_rows)
+            audit_row += 1
         for details in all_details:
             if details is None or details.empty:
                 continue
@@ -3193,6 +3234,7 @@ def main_with_excel():
     for cache in (YAHOO_TARGET_CACHE, YAHOO_FAILURES, YAHOO_FETCH_TIMINGS, PIPELINE_TIMINGS):
         cache.clear()
     print(f"ETF analyst report version: {REPORT_VERSION}")
+    print("FMP fallback configured: " + ("yes" if os.getenv("FMP_API_KEY") else "no"))
 
     all_details = []
     summaries = []

@@ -92,10 +92,19 @@ class YahooSession(Session):
                 else:
                     status = response.status_code
                     self.metrics[f"{family} HTTP {status}"] += 1
+                    if family == "getcrumb" and status == 200:
+                        body = response.text.strip().lower()
+                        if "too many requests" in body:
+                            status = 429
+                            self.metrics["getcrumb rate-limit payload"] += 1
+                        elif "invalid crumb" in body or "unauthorized" in body:
+                            status = 401
+                            self.metrics["getcrumb authentication payload"] += 1
+                        elif not body or body.startswith(("<", "{", "[")):
+                            self.open_reason = "Yahoo crumb unavailable"
+                            raise self._error(family, "empty or invalid crumb response")
                     # The cookie bootstrap normally receives a 404 carrying a cookie.
                     if status < 400 or (status == 404 and urlsplit(url).hostname == "fc.yahoo.com"):
-                        if family == "getcrumb" and not response.text.strip():
-                            raise self._error(family, "empty crumb")
                         self.auth_failures[family] = 0
                         if family not in {"getcrumb", "session"}:
                             self.rate_failures = 0
