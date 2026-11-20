@@ -34,13 +34,11 @@ jobs:
       - name: Run regression tests
         run: python -m pytest -q
 
-      - name: Run ETF analyst report with retry
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 45
-          max_attempts: 2
-          retry_wait_seconds: 60
-          command: python etf_analyst_report_complete.py
+      - name: Generate validated ETF report
+        timeout-minutes: 45
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python -u etf_analyst_report_complete.py
 
       - name: Commit PE history (fail on conflict)
         run: |

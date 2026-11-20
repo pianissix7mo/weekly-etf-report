@@ -35,18 +35,18 @@ def test_dated_daily_candle_beats_stale_fast_info(monkeypatch):
     def no_fallback(*args, **kwargs):
         pytest.fail("fresh primary candle must not require download fallback")
 
-    monkeypatch.setattr(prices.yf, "download", no_fallback)
+    monkeypatch.setattr(prices, "fetch_public_dated_close", no_fallback)
     price, date = prices.fetch_dated_close(Ticker(), "NVDA", now=RUN_DATE)
     assert price == pytest.approx(168.89)
     assert date == "2026-11-10"
 
 
-def test_stale_primary_candle_retries_second_dated_source(monkeypatch):
+def test_stale_primary_candle_uses_independent_dated_source(monkeypatch):
     class Ticker:
         def history(self, **kwargs):
             return bar("2026-11-09", 178.67)
 
-    monkeypatch.setattr(prices.yf, "download", lambda *args, **kwargs: bar("2026-11-10", 168.89))
+    monkeypatch.setattr(prices, "fetch_public_dated_close", lambda symbol, day: (168.89, day))
     price, date = prices.fetch_dated_close(Ticker(), "NVDA", now=RUN_DATE)
     assert price == pytest.approx(168.89)
     assert date == "2026-11-10"
@@ -95,7 +95,7 @@ def test_core_holding_missing_daily_quote_cannot_silently_pass(monkeypatch):
 def test_undated_etf_quote_is_not_exported(monkeypatch):
     monkeypatch.setattr(pipeline, "fetch_dated_close", lambda *args: (679.35, "2026-11-09"))
     monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
-    monkeypatch.setattr(pipeline.yf, "Ticker", lambda *_: object())
+    monkeypatch.setattr(pipeline.yf, "Ticker", lambda *_, **_kw: object())
     with pytest.raises(ReportIncompleteError, match="ETF quote stale"):
         pipeline.get_etf_current_price("QQQ")
 
@@ -116,7 +116,6 @@ def test_backup_dated_close_used_only_when_yahoo_daily_bar_is_stale(monkeypatch)
         def history(self, **kwargs):
             return bar("2026-11-09", 178.67)
 
-    monkeypatch.setattr(prices.yf, "download", lambda *args, **kwargs: bar("2026-11-09", 178.67))
     backup_calls = []
 
     def fresh_backup(symbol, required):
@@ -222,7 +221,7 @@ def test_asian_market_intraday_candle_is_not_treated_as_a_close(monkeypatch):
         def history(self, **kwargs):
             return frame
 
-    monkeypatch.setattr(prices.yf, "download", lambda *a, **kw: pytest.fail("should use primary"))
+    monkeypatch.setattr(prices, "fetch_public_dated_close", lambda *a, **kw: pytest.fail("should use primary"))
     quote, day = prices.fetch_dated_close(Ticker(), "005930.KS", now=RUN_DATE)
     assert (quote, day) == (150.0, "2026-11-10")
 
@@ -234,7 +233,7 @@ def test_us_stock_intraday_candle_is_not_a_completed_close(monkeypatch):
         def history(self, **kwargs):
             return frame
 
-    monkeypatch.setattr(prices.yf, "download", lambda *a, **kw: pytest.fail("should use prior close"))
+    monkeypatch.setattr(prices, "fetch_public_dated_close", lambda *a, **kw: pytest.fail("should use prior close"))
     quote, day = prices.fetch_dated_close(Ticker(), "NVDA", now=before_close)
     assert (quote, day) == (178.67, "2026-11-09")
 
@@ -242,7 +241,7 @@ def test_us_stock_intraday_candle_is_not_a_completed_close(monkeypatch):
 def test_toronto_listed_etf_has_a_close_date_gate(monkeypatch):
     monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
     monkeypatch.setattr(pipeline, "fetch_dated_close", lambda *_: (20.0, "2026-11-09"))
-    monkeypatch.setattr(pipeline.yf, "Ticker", lambda *_: object())
+    monkeypatch.setattr(pipeline.yf, "Ticker", lambda *_, **_kw: object())
     with pytest.raises(ReportIncompleteError, match="ETF quote stale"):
         pipeline.get_etf_current_price("TECH.TO")
 
@@ -291,11 +290,29 @@ def test_amsterdam_backup_uses_exchange_listing_not_us_ticker_page(monkeypatch):
             return None
     def fake_get(url, **kwargs):
         seen.append(url)
-        if "finance.yahoo.com" in url:
-            raise RuntimeError("Yahoo unavailable")
-        return Response()
+        response = Response()
+        response.url = url
+        return response
 
     monkeypatch.setattr(prices.requests, "get", fake_get)
     result = prices.fetch_public_dated_close("BESI.AS", "2026-11-10")
     assert result == (150.80, "2026-11-10")
     assert "https://stockanalysis.com/quote/ams/BESI/history/" in seen
+
+
+@pytest.mark.parametrize(("ticker", "now", "expected"), [
+    ("SPY", "2026-11-26T20:00:00-05:00", "2026-11-25"),  # US Thanksgiving
+    ("SPY", "2026-11-27T13:03:00-05:00", "2026-11-25"),  # still in settlement buffer
+    ("SPY", "2026-11-27T13:06:00-05:00", "2026-11-27"),  # US early close
+    ("TECH.TO", "2026-10-12T20:00:00-04:00", "2026-10-09"),  # Canadian Thanksgiving
+])
+def test_exchange_holidays_and_short_sessions(ticker, now, expected):
+    assert prices.expected_completed_session_date(ticker, now) == expected
+
+
+def test_no_price_returned_if_all_sources_have_wrong_session(monkeypatch):
+    monkeypatch.setattr(prices, "fetch_public_dated_close", lambda *args: (199, "2026-11-09"))
+    monkeypatch.setattr(prices.FMP, "close", lambda *args: None)
+    assert prices.resolve_dated_close("ANET", bar("2026-11-09", 198), "2026-11-10") == (
+        None, "2026-11-09", None
+    )

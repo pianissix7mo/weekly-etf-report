@@ -5,60 +5,64 @@ Never accept yfinance fast_info.last_price without a dated trading session.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
+from urllib.parse import urlsplit
+
+import exchange_calendars as calendars
+import numpy as np
 
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import yfinance as yf
+
+from etf_report.backup import FMP
 
 
 def is_us_quote(symbol):
     return bool(re.fullmatch(r"[A-Z]{1,6}(?:-[A-Z])?", str(symbol).upper()))
 
 
-# Quote times use the exchange's local clock, not the report runner's clock.
-# Add a few minutes after the official close for price data providers to settle.
-# The weekday expectation intentionally fails closed on an exchange holiday;
-# a holiday should not be mislabeled as a completed trading session.
+# Each exchange calendar includes holidays and special/early closes.
 _MARKETS = {
-    ".TO": ("America/Toronto", (16, 5)),
-    ".TW": ("Asia/Taipei", (13, 40)),
-    ".KS": ("Asia/Seoul", (15, 40)),
-    ".T": ("Asia/Tokyo", (15, 40)),
-    ".HK": ("Asia/Hong_Kong", (16, 10)),
-    ".AS": ("Europe/Amsterdam", (17, 40)),
-    ".DE": ("Europe/Berlin", (17, 40)),
-    ".SW": ("Europe/Zurich", (17, 40)),
-    ".PA": ("Europe/Paris", (17, 40)),
-    ".L": ("Europe/London", (16, 40)),
+    ".TO": ("XTSE", 5),
+    ".TW": ("XTAI", 10),
+    ".KS": ("XKRX", 10),
+    ".T": ("XTKS", 10),
+    ".HK": ("XHKG", 10),
+    ".AS": ("XAMS", 10),
+    ".DE": ("XETR", 10),
+    ".SW": ("XSWX", 10),
+    ".PA": ("XPAR", 10),
+    ".L": ("XLON", 10),
 }
 
 
+@lru_cache(maxsize=32)
+def _calendar(name, year):
+    return calendars.get_calendar(name, start=f"{year - 1}-01-01", end=f"{year + 1}-12-31")
+
+
+@lru_cache(maxsize=128)
+def _recent_sessions(name, day):
+    end = pd.Timestamp(day)
+    return _calendar(name, end.year).schedule.loc[end - pd.Timedelta(days=21):end, "close"]
+
+
 def expected_completed_session_date(symbol, now=None):
-    """Date of the most recent *completed* regular session for this listing.
-
-    Returns None for unknown markets rather than pretending to validate them.
-    """
+    """Date of the most recent completed session, including publication buffer."""
     name = str(symbol).upper().strip()
-    market = next(
-        (spec for suffix, spec in _MARKETS.items() if name.endswith(suffix)),
-        None,
-    )
+    market = next((spec for suffix, spec in _MARKETS.items() if name.endswith(suffix)), None)
     if market is None:
-        if not is_us_quote(name):
+        if not is_us_quote(name) and name != "^VIX":
             return None
-        market = ("America/New_York", (16, 5))
-    timezone, close_clock = market
-    moment = pd.Timestamp.now(tz=timezone) if now is None else pd.Timestamp(now)
-    if moment.tzinfo is None:
-        moment = moment.tz_localize(timezone)
-    else:
-        moment = moment.tz_convert(timezone)
-
-    if moment.weekday() < 5 and (moment.hour, moment.minute) >= close_clock:
-        return moment.strftime("%Y-%m-%d")
-    previous = moment.normalize() - pd.offsets.BDay(1)
-    return previous.strftime("%Y-%m-%d")
+        market = ("XNYS", 5)
+    calendar_name, buffer_minutes = market
+    moment = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    calendar = _calendar(calendar_name, moment.year)
+    local = moment.tz_localize(calendar.tz) if moment.tzinfo is None else moment.tz_convert(calendar.tz)
+    closes = _recent_sessions(calendar_name, local.date())
+    completed = closes[closes <= local - pd.Timedelta(minutes=buffer_minutes)]
+    return completed.index[-1].strftime("%Y-%m-%d") if not completed.empty else None
 
 
 def expected_us_close_date(now=None):
@@ -80,7 +84,7 @@ def parse_dated_close(history, required=None):
             return None, None
         close = history["Close"]
     close = pd.to_numeric(close, errors="coerce").dropna()
-    close = close[close > 0]
+    close = close[np.isfinite(close) & (close > 0)].sort_index()
     if required is not None:
         completed_rows = [
             idx for idx in close.index
@@ -88,8 +92,9 @@ def parse_dated_close(history, required=None):
         ]
         if not completed_rows:
             return None, None
-        last_idx = completed_rows[-1]
-        return float(close.loc[last_idx]), required
+        if len(completed_rows) != 1:
+            return None, None
+        return float(close.loc[completed_rows[0]]), required
     if close.empty:
         return None, None
     session = pd.Timestamp(close.index[-1]).strftime("%Y-%m-%d")
@@ -166,67 +171,53 @@ def fetch_public_dated_close(symbol, required):
         analysis_url = f"https://stockanalysis.com/etf/{symbol.lower()}/history/"
     else:
         analysis_url = f"https://stockanalysis.com/stocks/{symbol.lower()}/history/"
-    links = [
-        ("Yahoo Finance HTML", f"https://finance.yahoo.com/quote/{symbol}/history/"),
-        ("StockAnalysis historical HTML", analysis_url),
-    ]
-    for source, url in links:
-        try:
-            response = requests.get(url, headers=headers, timeout=12)
-            response.raise_for_status()
-            if "StockAnalysis" in source and (
-                "Market open" in response.text or "market open" in response.text.lower()
-            ) and "at close" not in response.text.lower():
-                continue
-            price, date = _parse_history_html_close(response.text, required)
-            if price is not None and date == required:
-                print(f"VERIFIED BACKUP CLOSE {symbol} {date} {price} via {source}")
-                return price, date
-        except Exception:
-            pass
+    try:
+        response = requests.get(analysis_url, headers=headers, timeout=12)
+        response.raise_for_status()
+        actual = urlsplit(response.url)
+        expected = urlsplit(analysis_url)
+        if actual.netloc != expected.netloc or actual.path.rstrip("/").lower() != expected.path.rstrip("/").lower():
+            return None, None
+        if "market open" in response.text.lower() and "at close" not in response.text.lower():
+            return None, None
+        price, date = _parse_history_html_close(response.text, required)
+        if price is not None and date == required:
+            print(f"VERIFIED BACKUP CLOSE {symbol} {date} {price} via StockAnalysis historical table")
+            return price, date
+    except requests.RequestException as error:
+        status = error.response.status_code if error.response is not None else type(error).__name__
+        print(f"StockAnalysis close {symbol}: {status}")
     return None, None
 
+
+def resolve_dated_close(symbol, history, required):
+    """Return a verified close, the observed session and provenance."""
+    price, day = parse_dated_close(history, required=required)
+    if price is not None and required is not None:
+        return price, day, "Yahoo daily chart"
+    _, observed = parse_dated_close(history)
+    if required:
+        price, day = fetch_public_dated_close(symbol, required)
+        if price is not None and day == required:
+            return price, day, "StockAnalysis historical table"
+        price = FMP.close(symbol, required)
+        if price is not None:
+            return price, required, "FMP unadjusted end-of-day"
+    # Preserve the observed date for the stale-quote gate without using the price.
+    return None, observed, None
+
+
 def fetch_dated_close(ticker, symbol, now=None):
-    """Use dated daily candles; retry via download when Yahoo returns a stale bar.
-
-    Returns (price, session_date). A stale result is returned with its actual date,
-    so downstream quality gates can refuse the workbook.
-    """
     required = expected_completed_session_date(symbol, now=now)
-    choices = []
     try:
-        hist = ticker.history(period="5d", interval="1d", auto_adjust=False, actions=False)
-        price, session = parse_dated_close(hist, required=required)
-        if price is not None:
-            return price, session
-        price, session = parse_dated_close(hist)
-        if price is not None:
-            choices.append((session, price))
-    except Exception:
-        pass
-
-    try:
-        hist = yf.download(
-            symbol, period="5d", interval="1d", auto_adjust=False,
-            progress=False, threads=False,
+        history = ticker.history(
+            period="5d", interval="1d", auto_adjust=False, actions=False,
+            raise_errors=True,
         )
-        price, session = parse_dated_close(hist, required=required)
-        if price is not None:
-            return price, session
-        price, session = parse_dated_close(hist)
-        if price is not None:
-            choices.append((session, price))
-    except Exception:
-        pass
-
-    # Published dated tables serve both US shares and supported foreign
-    # exchange listings when yfinance omits a completed daily candle.
-    if required is not None:
-        backup_price, backup_date = fetch_public_dated_close(symbol, required)
-        if backup_price is not None and backup_date == required:
-            return backup_price, backup_date
-
-    if not choices:
-        return None, None
-    session, price = max(choices, key=lambda x: x[0])
-    return price, session
+    except Exception as error:
+        print(f"Yahoo daily close {symbol}: {type(error).__name__}")
+        history = None
+    price, date, source = resolve_dated_close(symbol, history, required)
+    if source:
+        print(f"QUOTE {symbol}: session={date}, source={source}, retrieved={pd.Timestamp.now(tz='UTC').isoformat()}")
+    return price, date

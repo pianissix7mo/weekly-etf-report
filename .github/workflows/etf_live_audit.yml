@@ -2,9 +2,12 @@ name: ETF Live Data Audit (No Email)
 
 on:
   workflow_dispatch:
-  push:
+  pull_request:
     branches: [main]
     paths:
+      - etf_analyst_report_complete.py
+      - 'etf_report/**'
+      - requirements.txt
       - '.github/workflows/etf_live_audit.yml'
 
 # Isolated audit runs neither email nor commit PE history.
@@ -17,12 +20,13 @@ permissions:
 
 jobs:
   audit:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout current main
+      - name: Checkout audit revision
         uses: actions/checkout@v4
         with:
-          ref: main
+          persist-credentials: false
       - name: Python
         uses: actions/setup-python@v5
         with:
@@ -34,7 +38,10 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
       - name: Audit complete ETF report without sending or committing
-        run: python etf_analyst_report_complete.py
+        timeout-minutes: 45
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python -u etf_analyst_report_complete.py
       - name: Publish audit-only workbook
         uses: actions/upload-artifact@v4
         with:
