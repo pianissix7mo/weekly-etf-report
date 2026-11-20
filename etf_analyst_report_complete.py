@@ -62,7 +62,7 @@ from etf_report.errors import (
     SourceSchemaChangedError,
 )
 from etf_report.tickers import is_plausible_yahoo_symbol, looks_like_bad_row, map_name_to_yahoo, map_to_yahoo_symbol
-from etf_report.prices import expected_completed_session_date, expected_us_close_date, fetch_dated_close, is_us_quote, resolve_dated_close
+from etf_report.prices import expected_completed_session_date, expected_us_close_date, fetch_dated_close, is_us_quote, parse_dated_close, resolve_dated_close
 from etf_report.target_quality import (
     CORE_TARGET_TICKERS,
     complete_target_trio,
@@ -1404,11 +1404,39 @@ def fetch_daily_prices(symbol, ticker, required):
     except Exception as error:
         issues.append(f"Yahoo history: {type(error).__name__}")
 
-    close, observed, price_source = resolve_dated_close(symbol, history, required)
+    close_history = history
+    short_history = None
+    _, last_observed = parse_dated_close(history)
+    if last_observed and parse_dated_close(history, required)[0] is None:
+        # A successful long date-range chart can lag the short recent window.
+        # Query the latter once for this symbol, only when a candle is missing.
+        try:
+            short = ticker.history(
+                period="5d", interval="1d", auto_adjust=False, actions=False,
+                raise_errors=True,
+            )
+            if parse_dated_close(short, required)[0] is not None:
+                short_history = close_history = short
+            else:
+                _, short_observed = parse_dated_close(short)
+                issues.append(f"Yahoo short window: observed={short_observed}, required={required}")
+        except Exception as error:
+            issues.append(f"Yahoo short window: {type(error).__name__}")
+
+    close, observed, price_source = resolve_dated_close(symbol, close_history, required)
+    if short_history is not None:
+        price_source = "Yahoo short-window daily chart"
     if close is None:
         issues.append(f"close missing or date mismatch: observed={observed}, required={required}")
 
     adjusted = _clean_close_series(history, allow_close=False).loc[:day]
+    if short_history is not None and day not in adjusted:
+        recent_adjusted = _clean_close_series(short_history, allow_close=False).loc[:day]
+        overlap = adjusted.index.intersection(recent_adjusted.index)
+        if day in recent_adjusted and len(overlap) >= 2 and np.allclose(
+                adjusted.loc[overlap], recent_adjusted.loc[overlap], rtol=1e-6, atol=0):
+            # Both windows must agree on the adjusted basis before appending.
+            adjusted = pd.concat([adjusted, recent_adjusted.loc[[day]]]).sort_index()
     source = "Yahoo dividend/split-adjusted chart"
     baselines = [
         pd.Timestamp(boundary) for year in (day.year - 1, day.year - 2)

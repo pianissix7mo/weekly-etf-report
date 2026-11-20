@@ -253,3 +253,29 @@ def test_failure_revokes_prior_manifest_and_cannot_deliver(tmp_path, monkeypatch
     assert not (tmp_path / MANIFEST_NAME).exists()
     with pytest.raises(RuntimeError, match="delivery validation failed"):
         load_delivery(tmp_path)
+
+
+@pytest.mark.parametrize("adjustments_match", [True, False])
+def test_stale_wide_yahoo_chart_checks_short_window_once(monkeypatch, adjustments_match):
+    full = pd.DataFrame(
+        {"Close": [90, 95], "Adj Close": [90, 95]},
+        index=pd.to_datetime(["2026-11-17", "2026-11-18"]),
+    )
+    short = pd.DataFrame(
+        {"Close": [90, 95, 100], "Adj Close": [90, 95 if adjustments_match else 91, 100]},
+        index=pd.to_datetime(["2026-11-17", "2026-11-18", "2026-11-19"]),
+    )
+    calls = []
+
+    def history(**kwargs):
+        calls.append(kwargs)
+        return short if kwargs.get("period") == "5d" else full
+
+    monkeypatch.setattr(pipeline.FMP, "adjusted_history", lambda *args: pd.Series(dtype=float))
+    close, day, source, adjusted, _, issues = pipeline.fetch_daily_prices(
+        "META", SimpleNamespace(history=history), "2026-11-19",
+    )
+    assert (close, day, source) == (100, "2026-11-19", "Yahoo short-window daily chart")
+    assert len(calls) == 2
+    assert (pd.Timestamp(day) in adjusted) == adjustments_match
+    assert ("missing latest completed session" in issues) != adjustments_match
