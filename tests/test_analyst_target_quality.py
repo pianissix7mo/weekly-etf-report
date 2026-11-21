@@ -105,7 +105,7 @@ def test_missing_googl_target_is_never_filled_from_another_class(monkeypatch):
     assert pd.isna(result.iloc[0]["Target Source"])
 
 
-def test_major_googl_target_gap_fails_quality_gate(monkeypatch):
+def test_major_googl_target_gap_is_warned_not_fatal(monkeypatch, capsys):
     monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda symbol: "2026-11-12")
     row = pd.DataFrame([{
         "Yahoo Ticker": "GOOGL", "Weight Decimal": 0.03,
@@ -120,5 +120,5 @@ def test_major_googl_target_gap_fails_quality_gate(monkeypatch):
     }])
     summary = {"Covered Weight": 0.97, "PE Coverage Weight": 0.97,
                "Forward PE Coverage Weight": 1.0}
-    with pytest.raises(ReportIncompleteError, match="major holding missing analyst targets.*GOOGL"):
-        pipeline.validate_yahoo_data_quality(row, summary, "QQQ")
+    pipeline.validate_yahoo_data_quality(row, summary, "QQQ")
+    assert "major holding analyst targets unavailable: ['GOOGL']" in capsys.readouterr().out
