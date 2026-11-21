@@ -1533,7 +1533,15 @@ def pull_yahoo_targets(symbol):
                 out[f"{field} Source"] = fallback_source
             else:
                 errors.append(f"{field}: missing or invalid")
-    if out["Trailing PE"] is not None or out["Forward PE"] is not None:
+    if price is None:
+        # An undated quote-summary PE cannot represent today's valuation.
+        # Preserve target provenance for auditing, but exclude stale valuation.
+        out["Trailing PE"] = None
+        out["Forward PE"] = None
+        out["Trailing PE Source"] = None
+        out["Forward PE Source"] = None
+        out["PE Retrieved UTC"] = None
+    elif out["Trailing PE"] is not None or out["Forward PE"] is not None:
         out["PE Retrieved UTC"] = pd.Timestamp.now(tz="UTC").isoformat()
 
     if price is not None and day and pd.Timestamp(day) in history:
@@ -1732,7 +1740,8 @@ def validate_yahoo_data_quality(df, summary, etf):
             missing_key_targets = key_targets & ~valid_targets
             if missing_key_targets.any():
                 names = sorted(ticker_series[missing_key_targets].unique().tolist())
-                failures.append(f"major holding missing analyst targets: {names}")
+                print(f"WARNING {etf}: major holding analyst targets unavailable: {names}; "
+                      "uncovered holdings excluded from projected returns.")
     # Freshness is a weighted gate, not just a non-null price coverage check.
     # Before the fix, yesterday's NVDA price passed with 100% coverage.
     if "Yahoo Ticker" in df.columns and "Price Date" in df.columns:
@@ -1740,19 +1749,26 @@ def validate_yahoo_data_quality(df, summary, etf):
         checked_quotes = required.notna()
         as_of = df["Price Date"].fillna("").astype(str)
         stale = checked_quotes & (prices.notna() | as_of.ne("")) & (as_of != required)
-        stale_weight = float(weights[stale].sum() / total_weight)
-        if stale_weight > 0.005:
-            sample = df.loc[stale, ["Yahoo Ticker", "Price Date"]].head(8).to_dict("records")
-            failures.append(
-                f"exchange-dated close freshness failed: stale portfolio weight "
-                f"{stale_weight:.1%} > 0.5%; examples={sample}"
-            )
+        # Never allow a non-null stale price to enter any calculation.
+        # A failed fetch that already has Current Price=None is different:
+        # it can be excluded without blocking other valid holdings.
+        stale_priced = stale & prices.notna()
+        if stale_priced.any():
+            sample = df.loc[stale_priced, ["Yahoo Ticker", "Price Date"]].head(8).to_dict("records")
+            failures.append(f"stale-priced holding would contaminate calculations: {sample}")
+        missing_quotes = checked_quotes & prices.isna()
+        if missing_quotes.any():
+            affected = float(weights[missing_quotes].sum() / total_weight)
+            sample = df.loc[missing_quotes, ["Yahoo Ticker", "Price Date"]].head(8).to_dict("records")
+            print(f"WARNING {etf}: unavailable verified closes cover {affected:.1%} "
+                  f"of portfolio; excluded from calculations: {sample}")
         core = {"NVDA", "AAPL", "MSFT", "AMZN", "META", "AMD", "MU", "AVGO", "TSLA"}
         key_quotes = checked_quotes & df["Yahoo Ticker"].astype(str).isin(core) & (weights >= 0.02)
         missing_fresh_key = key_quotes & (prices.isna() | (as_of != required))
         if missing_fresh_key.any():
             missing = df.loc[missing_fresh_key, "Yahoo Ticker"].astype(str).tolist()
-            failures.append(f"major holding missing fresh dated close: {missing}")
+            print(f"WARNING {etf}: major holdings missing verified closes: {missing}; "
+                  "excluded, not treated as current prices.")
     if price_coverage < 0.50:
         failures.append(f"price coverage {price_coverage:.1%} < 50%")
     if target_coverage < 0.05:
@@ -1778,6 +1794,34 @@ def validate_yahoo_data_quality(df, summary, etf):
         f"targets={target_coverage:.1%}, PE={pe_coverage:.1%}, "
         f"forward PE={forward_pe_coverage:.1%}"
     )
+
+
+
+def collect_missing_quote_warnings(all_details):
+    """Audit missing prices without ever substituting an older close."""
+    warnings = []
+    for details in all_details:
+        if details is None or details.empty:
+            continue
+        for _, row in details.iterrows():
+            ticker = str(row.get("Yahoo Ticker") or "").strip()
+            required = expected_completed_session_date(ticker) if ticker else None
+            if required is None:
+                continue
+            value = safe_float_value(row.get("Current Price"))
+            as_of = row.get("Price Date")
+            observed = "" if pd.isna(as_of) else str(as_of)
+            if value is not None and observed == required:
+                continue
+            warnings.append({
+                "ETF": str(row.get("ETF") or ""),
+                "Ticker": ticker,
+                "Weight": safe_float_value(row.get("Weight Decimal")) or 0.0,
+                "Observed Date": observed,
+                "Required Date": required,
+                "Issue": "UNAVAILABLE VERIFIED CLOSE" if value is None else "STALE PRICE",
+            })
+    return warnings
 
 
 # CALCULATIONS
@@ -2830,6 +2874,7 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
 
     summary_df = pd.DataFrame(summaries)
     summary_rows = build_excel_summary_rows(summary_df)
+    quote_warnings = collect_missing_quote_warnings(all_details)
     fear_greed_summary, fear_greed_error = build_fear_greed_summary()
     vix_summary, vix_error = build_vix_summary()
     pe_history = load_pe_history() if pe_history is None else pe_history
@@ -2888,6 +2933,10 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
         ]
 
         worksheet.write(0, 1, "Summary order check: K=PE Ratio, L=Forward PE, M=PE coverage, N=Forward PE coverage", section_fmt)
+        if quote_warnings:
+            worksheet.write(1, 1,
+                f"PARTIAL DATA: {len(quote_warnings)} missing/invalid holding close(s). "
+                "Estimates exclude those holdings; see Data_Quality and Price_Audit.", section_fmt)
         worksheet.write(start_row, start_col, report_date, header_fmt)
         for offset, (_excel_col, label, _key, _fmt) in enumerate(summary_columns[1:], start=1):
             worksheet.write(start_row, start_col + offset, label, header_white_fmt)
@@ -3084,6 +3133,29 @@ def export_excel_report(all_details, summaries, output_path=None, report_date=No
             ws.set_column("P:S", 12)
             ws.set_column("T:V", 11)
             ws.set_default_row(18)
+
+        # ---------------- Explicit data-quality exceptions ----------------
+        quality_ws = workbook.add_worksheet("Data_Quality")
+        writer.sheets["Data_Quality"] = quality_ws
+        quality_ws.freeze_panes(1, 0)
+        quality_ws.set_column("A:B", 16)
+        quality_ws.set_column("C:C", 19)
+        quality_ws.set_column("D:E", 20)
+        quality_ws.set_column("F:F", 33)
+        for j, header in enumerate(["ETF", "Ticker", "Portfolio Weight", "Observed Close Date",
+                                     "Required Close Date", "Issue"]):
+            quality_ws.write(0, j, header, header_fmt)
+        if not quote_warnings:
+            quality_ws.write(1, 0, "No missing verified holding closes")
+        else:
+            for idx, warning in enumerate(quote_warnings, start=1):
+                quality_ws.write(idx, 0, warning["ETF"])
+                quality_ws.write(idx, 1, warning["Ticker"])
+                quality_ws.write_number(idx, 2, warning["Weight"], pct_fmt)
+                quality_ws.write(idx, 3, warning["Observed Date"])
+                quality_ws.write(idx, 4, warning["Required Date"])
+                quality_ws.write(idx, 5, warning["Issue"])
+        print(f"Data quality: {len(quote_warnings)} missing/invalid holding close(s)")
 
         # ---------------- Dated quote audit (do not label an old close as today's) ----------------
         audit = workbook.add_worksheet("Price_Audit")
@@ -3304,7 +3376,7 @@ def main_with_excel():
     report_started = time.perf_counter()
     pe_history = update_pe_history(summaries)
     export_excel_report(all_details, summaries, pe_history=pe_history)
-    write_delivery_manifest(REPORT_PATH)
+    write_delivery_manifest(REPORT_PATH, warnings=collect_missing_quote_warnings(all_details))
     report_seconds = time.perf_counter() - report_started
     print("Yahoo transport after workbook export: " + json.dumps(dict(YAHOO_SESSION.metrics), sort_keys=True))
 
