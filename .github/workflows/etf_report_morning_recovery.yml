@@ -27,7 +27,8 @@ jobs:
         run: |
           set -euo pipefail
           # Exclude yesterday's MORNING recovery (for the prior session).
-          cutoff="$(TZ=America/Toronto date -d 'yesterday 12:00' -u +'%Y-%m-%dT%H:%M:%SZ')"
+          cutoff_epoch="$(TZ=America/Toronto date -d 'yesterday 12:00' +'%s')"
+          cutoff="$(date -u -d "@$cutoff_epoch" +'%Y-%m-%dT%H:%M:%SZ')"
           echo "Checking successful production runs created since $cutoff"
           success_count="$(
             gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/refactor_safe_production.yml/runs?status=success&per_page=100" \
