@@ -1,0 +1,51 @@
+name: ETF Analyst Report - Next Morning Recovery
+
+# After a failed trading-day production, retry after Yahoo's overnight update.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 8 * * 2-6"
+      timezone: "America/Toronto"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: etf-analyst-morning-recovery
+  cancel-in-progress: false
+
+jobs:
+  check-and-recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no successful afternoon or evening production delivery
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exclude yesterday's MORNING recovery (for the prior session).
+          cutoff="$(TZ=America/Toronto date -d 'yesterday 12:00' -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "Checking successful production runs created since $cutoff"
+          success_count="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/refactor_safe_production.yml/runs?status=success&per_page=100" \
+              --jq "[.workflow_runs[] | select(.created_at >= \"$cutoff\")] | length"
+          )"
+          if [ "$success_count" -gt 0 ]; then
+            echo "Production delivery already succeeded. No duplicate report."
+            echo "should_recover=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No successful delivery after yesterday noon. Requesting recovery."
+            echo "should_recover=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch production recovery (same strict data checks)
+        if: steps.check.outputs.should_recover == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/refactor_safe_production.yml/dispatches" -f ref=main
+          echo "Recovery requested; it will still fail closed if Yahoo remains stale."
