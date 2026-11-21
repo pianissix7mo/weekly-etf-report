@@ -40,6 +40,16 @@ jobs:
       - name: Run regression tests
         run: python -m pytest -q
 
+      # One short, dated-close check prevents 15+ minutes of pointless
+      # enrichment when Yahoo's entire daily feed is one session behind.
+      - name: Wait for completed-session Yahoo closes
+        timeout-minutes: 25
+        env:
+          ETF_PREFLIGHT_ATTEMPTS: 6
+          ETF_PREFLIGHT_DELAY_SECONDS: 180
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python -u -m etf_report.readiness
+
       - name: Generate validated ETF report
         timeout-minutes: 45
         env:

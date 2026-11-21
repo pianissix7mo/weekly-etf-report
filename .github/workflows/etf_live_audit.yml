@@ -37,6 +37,14 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: Run tests
         run: python -m pytest -q
+      # A stale external provider should be identified before the live ETF crawl.
+      - name: Verify completed-session quotes for live audit
+        timeout-minutes: 5
+        env:
+          ETF_PREFLIGHT_ATTEMPTS: 1
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python -u -m etf_report.readiness
+
       - name: Audit complete ETF report without sending or committing
         timeout-minutes: 45
         env:
