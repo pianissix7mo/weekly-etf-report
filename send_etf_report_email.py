@@ -16,6 +16,7 @@ Optional environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import smtplib
 import ssl
@@ -84,7 +85,8 @@ def validate_report_attachment(report_path: Path) -> None:
 
 
 def send_email_with_attachment(report_path: Path, *, data: bytes | None = None,
-                               generated_at: datetime | None = None) -> None:
+                               generated_at: datetime | None = None,
+                               warnings: list[dict] | None = None) -> None:
     smtp_host = env_required("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
     smtp_user = env_required("SMTP_USER")
@@ -100,17 +102,38 @@ def send_email_with_attachment(report_path: Path, *, data: bytes | None = None,
     toronto_now = datetime.now(ZoneInfo("America/Toronto"))
     today = toronto_now.strftime("%Y-%m-%d")
 
+    warnings = list(warnings or [])
     msg = EmailMessage()
-    msg["Subject"] = f"ETF Analyst Report - {today} {toronto_now:%H:%M} Toronto"
+    msg["Subject"] = (f"ETF Analyst Report - {today} {toronto_now:%H:%M} Toronto"
+                      + (" [PARTIAL DATA]" if warnings else ""))
     msg["From"] = email_from
     msg["To"] = ", ".join(recipients)
     msg["Date"] = format_datetime(toronto_now)
     msg["Message-ID"] = make_msgid()
+    warning_text = ""
+    if warnings:
+        warning_text = (
+            f"PARTIAL DATA WARNING: {len(warnings)} ETF holding quote row(s) "
+            "could not be independently verified for the required close date. "
+            "Those holdings are excluded from price-based estimates, not assigned "
+            "a zero return or a stale close. See Data_Quality and Price_Audit tabs.\n"
+        )
+        for item in warnings[:60]:
+            warning_text += (
+                f"  {item.get('ETF', '?')}: {item.get('Ticker', '?')} "
+                f"({float(item.get('Weight', 0)):.2%} holding weight; "
+                f"observed={item.get('Observed Date') or 'N/A'}; "
+                f"required={item.get('Required Date') or 'N/A'})\n"
+            )
+        if len(warnings) > 60:
+            warning_text += f"  ...and {len(warnings) - 60} more rows in the attachment.\n"
+        warning_text += "\n"
     msg.set_content(
         "Hi,\n\n"
         "Attached is the latest daily ETF analyst target report.\n\n"
         f"File: {report_path.name}\n\n"
         + (f"Report generated: {generated_at.isoformat()}\n\n" if generated_at else "")
+        + warning_text
         + "This email was sent automatically by GitHub Actions.\n"
     )
 
@@ -142,6 +165,10 @@ def main() -> None:
     report_dir = Path(os.environ.get("REPORT_DIR", "etf_analyst_target_outputs"))
     report_path, data, generated_at = load_delivery(report_dir)
     validate_report_attachment(report_path)
+    manifest = json.loads((report_dir / "ETF_analyst_report.delivery.json").read_text(encoding="utf-8"))
+    warnings = manifest.get("warnings", [])
+    if not isinstance(warnings, list):
+        raise RuntimeError("Invalid delivery warning metadata")
 
     today_code = generated_at.strftime("%y%m%d")
     dated_report_path = report_dir / f"ETF_analyst_report_{today_code}.xlsx"
@@ -150,7 +177,7 @@ def main() -> None:
         dated_report_path.write_bytes(data)
         report_path = dated_report_path
 
-    send_email_with_attachment(report_path, data=data, generated_at=generated_at)
+    send_email_with_attachment(report_path, data=data, generated_at=generated_at, warnings=warnings)
 
 
 if __name__ == "__main__":

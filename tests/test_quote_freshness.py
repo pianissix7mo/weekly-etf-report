@@ -79,17 +79,26 @@ def test_stale_nvda_cannot_pass_high_coverage_quality_gate(monkeypatch):
     pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
 
 
-def test_core_holding_missing_daily_quote_cannot_silently_pass(monkeypatch):
+def test_missing_single_major_close_is_marked_and_does_not_stop_etf(monkeypatch, capsys):
     monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-10")
     df = pd.DataFrame({
+        "ETF": ["QQQ", "QQQ"],
         "Yahoo Ticker": ["NVDA", "AAPL"],
         "Weight Decimal": [0.07, 0.93],
         "Current Price": [None, 350.0],
-        "Price Date": [None, "2026-11-10"],
+        "Price Date": ["2026-11-09", "2026-11-10"],
+        "Target Low": [None, 300.0],
+        "Target Mean": [None, 370.0],
+        "Target High": [None, 420.0],
     })
     summary = {"Covered Weight": 0.93, "PE Coverage Weight": 0.93, "Forward PE Coverage Weight": 0.93}
-    with pytest.raises(ReportIncompleteError, match="major holding"):
-        pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
+    pipeline.validate_yahoo_data_quality(df, summary, "QQQ")
+    assert "WARNING QQQ" in capsys.readouterr().out
+    warnings = pipeline.collect_missing_quote_warnings([df])
+    assert len(warnings) == 1
+    assert warnings[0]["Ticker"] == "NVDA"
+    assert warnings[0]["Weight"] == pytest.approx(0.07)
+    assert warnings[0]["Issue"] == "UNAVAILABLE VERIFIED CLOSE"
 
 
 def test_undated_etf_quote_is_not_exported(monkeypatch):
@@ -282,3 +291,45 @@ def test_no_price_returned_if_all_sources_have_wrong_session(monkeypatch):
     assert prices.resolve_dated_close("ANET", bar("2026-11-09", 198), "2026-11-10") == (
         None, "2026-11-09", None
     )
+
+
+def test_sndk_corporate_action_quote_gap_keeps_other_holdings_usable(monkeypatch):
+    """The 2026-11-20 SNDK missing quote must not take down four ETF tabs."""
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-20")
+    for etf, sndk_weight in [("SPMO", 0.015), ("DRAM", 0.029),
+                             ("XLK", 0.008), ("QQQ", 0.0051)]:
+        df = pd.DataFrame({
+            "ETF": [etf, etf],
+            "Yahoo Ticker": ["SNDK", "AAPL"],
+            "Weight Decimal": [sndk_weight, 1 - sndk_weight],
+            "Current Price": [None, 278.0],
+            "Price Date": ["2026-11-19", "2026-11-20"],
+            "Target Low": [None, 240.0],
+            "Target Mean": [None, 300.0],
+            "Target High": [None, 340.0],
+        })
+        summary = {"Covered Weight": 1 - sndk_weight,
+                   "PE Coverage Weight": 1 - sndk_weight,
+                   "Forward PE Coverage Weight": 1 - sndk_weight}
+        pipeline.validate_yahoo_data_quality(df, summary, etf)
+        warnings = pipeline.collect_missing_quote_warnings([df])
+        assert [r["Ticker"] for r in warnings] == ["SNDK"]
+        assert warnings[0]["Weight"] == pytest.approx(sndk_weight)
+
+
+def test_stale_nonnull_sndk_close_never_allowed_into_return_calculation(monkeypatch):
+    monkeypatch.setattr(pipeline, "expected_completed_session_date", lambda *_: "2026-11-20")
+    df = pd.DataFrame({
+        "ETF": ["DRAM", "DRAM"],
+        "Yahoo Ticker": ["SNDK", "AAPL"],
+        "Weight Decimal": [0.029, 0.971],
+        "Current Price": [40.0, 278.0],
+        "Price Date": ["2026-11-19", "2026-11-20"],
+        "Target Low": [35, 240],
+        "Target Mean": [50, 300],
+        "Target High": [60, 340],
+    })
+    summary = {"Covered Weight": 1.0, "PE Coverage Weight": 1.0,
+               "Forward PE Coverage Weight": 1.0}
+    with pytest.raises(ReportIncompleteError, match="stale-priced"):
+        pipeline.validate_yahoo_data_quality(df, summary, "DRAM")
