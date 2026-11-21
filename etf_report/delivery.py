@@ -10,7 +10,7 @@ TORONTO = ZoneInfo("America/Toronto")
 MANIFEST_NAME = "ETF_analyst_report.delivery.json"
 
 
-def write_delivery_manifest(report_path: Path) -> None:
+def write_delivery_manifest(report_path: Path, warnings=None) -> None:
     report_path = Path(report_path)
     payload = {
         "filename": report_path.name,
@@ -18,6 +18,7 @@ def write_delivery_manifest(report_path: Path) -> None:
         "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
         "run_id": os.environ.get("GITHUB_RUN_ID", ""),
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        "warnings": list(warnings or []),
     }
     target = report_path.parent / MANIFEST_NAME
     temporary = target.with_suffix(".tmp")
