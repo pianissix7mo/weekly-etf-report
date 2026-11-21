@@ -1755,7 +1755,7 @@ def validate_yahoo_data_quality(df, summary, etf):
         stale_priced = stale & prices.notna()
         if stale_priced.any():
             sample = df.loc[stale_priced, ["Yahoo Ticker", "Price Date"]].head(8).to_dict("records")
-            failures.append(f"stale-priced holding would contaminate calculations: {sample}")
+            failures.append(f"exchange-dated close freshness failed: stale-priced holding would contaminate calculations: {sample}")
         missing_quotes = checked_quotes & prices.isna()
         if missing_quotes.any():
             affected = float(weights[missing_quotes].sum() / total_weight)
