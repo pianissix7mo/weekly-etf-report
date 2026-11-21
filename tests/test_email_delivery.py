@@ -184,3 +184,20 @@ def test_complete_pipeline_exports_pe_history_and_emails_generated_workbook(tmp_
     connection.send_message.assert_called_once()
     attachment = next(connection.send_message.call_args.args[0].iter_attachments())
     assert attachment.get_payload(decode=True) == report.read_bytes()
+
+
+def test_partial_data_warning_in_email_and_manifest(report, smtp, monkeypatch):
+    issues = [{
+        "ETF": "DRAM", "Ticker": "SNDK", "Weight": 0.029,
+        "Observed Date": "2026-11-19", "Required Date": "2026-11-20",
+        "Issue": "UNAVAILABLE VERIFIED CLOSE",
+    }]
+    write_delivery_manifest(report, warnings=issues)
+    manifest = json.loads((report.parent / MANIFEST_NAME).read_text())
+    assert manifest["warnings"] == issues
+    _, connection = smtp
+    emailer.send_email_with_attachment(report, data=b"test snapshot", warnings=issues)
+    msg = connection.send_message.call_args.args[0]
+    assert "[PARTIAL DATA]" in msg["Subject"]
+    assert "SNDK" in msg.get_body(preferencelist=("plain",)).get_content()
+    assert "excluded" in msg.get_body(preferencelist=("plain",)).get_content()
